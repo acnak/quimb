@@ -321,6 +321,14 @@ def apply_cu3(psi, theta, phi, lamda, i, j, parametrize=False, **gate_opts):
         G = cu3(theta, phi, lamda)
     psi.gate_(G, (int(i), int(j)), tags=mtags, **gate_opts)
 
+def apply_unitary(psi, unitary, *i, parametrize=False, **gate_opts):
+    mtags = _merge_tags('U', gate_opts)
+    G = np.matrix(unitary)
+
+    if not np.allclose(np.eye(G.shape[0]), G.H * G):
+        raise ValueError("Non unitary matrix supplied") 
+
+    psi.gate_(G, i, tags=mtags, **gate_opts)
 
 def cu2_param_gen(params):
     U2 = u2_gate_param_gen(params)
@@ -599,6 +607,7 @@ GATE_FUNCTIONS = {
     'U1': apply_U1,
     # two qubit parametrizable gates
     'CU3': apply_cu3,
+    'U': apply_unitary,
     'CU2': apply_cu2,
     'CU1': apply_cu1,
     'FS': apply_fsim,

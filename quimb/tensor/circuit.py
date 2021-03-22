@@ -882,8 +882,6 @@ class Circuit:
         for gate in gates:
             self.apply_gate(*gate)
 
-        self._psi.squeeze_()
-
     def apply_circuit(self, gates):  # pragma: no cover
         import warnings
         msg = ("``apply_circuit`` is deprecated in favour of ``apply_gates``.")

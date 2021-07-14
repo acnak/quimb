@@ -430,6 +430,33 @@ def controlled(s, dtype=complex, sparse=False):
     make_immutable(op)
     return op
 
+@functools.lru_cache(maxsize=16)
+def CU3(theta, phi, lamda, dtype=complex, sparse=False):
+    """Construct a controlled U3 gate for two qubits.
+
+    Parameters
+    ----------
+    theta : float
+        Angle between 0 and pi.
+    phi : float
+        Angle between 0 and 2 pi.
+    lamba : float
+        Angle between 0 and 2 pi.
+    sparse : bool, optional
+        Whether to construct a sparse operator.
+
+    Returns
+    -------
+    C : immutable operator
+        The controlled two-qubit gate operator.
+    """
+    # alias not and NOT to x
+    kws = {'dtype': dtype, 'sparse': sparse}
+    op = ((qu([1, 0], qtype='dop', **kws) & eye(2, **kws)) +
+          (qu([0, 1], qtype='dop', **kws) & U_gate(theta, phi, lamda, **kws)))
+    make_immutable(op)
+    return op
+
 
 @functools.lru_cache(8)
 def CNOT(dtype=complex, sparse=False):

@@ -26,3 +26,5 @@ ISWAP = operators.iswap()
 
 U3 = operators.U_gate
 fsim = operators.fsim
+
+CU3 = operators.CU3

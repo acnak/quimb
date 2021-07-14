@@ -1,6 +1,7 @@
 """Classes and algorithms related to 1D tensor networks.
 """
 
+import numpy as np
 import re
 import operator
 import functools
@@ -1235,7 +1236,7 @@ class TensorNetwork1DFlat(TensorNetwork1D,
             If supplied, simultaneously mixed canonize this MPS too, assuming
             it to be the conjugate state.
         """
-        if isinstance(where, int):
+        if isinstance(where, int) or isinstance(where, np.int64):
             i = j = where
         else:
             i, j = min(where), max(where)
@@ -2190,6 +2191,11 @@ class MatrixProductState(TensorNetwork1DVector,
                     rho >>= [self.site_tag(i), self.site_tag(max(keep))]
 
                 rho.drop_tags(self.site_tag(i))
+
+                # if single site a single tensor is produced
+                if isinstance(rho, Tensor):
+                    rho = TensorNetwork([rho])
+
 
         # if single site a single tensor is produced
         if isinstance(rho, Tensor):

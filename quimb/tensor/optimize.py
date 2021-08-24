@@ -2,6 +2,7 @@
 automatically derive gradients for input to scipy optimizers.
 """
 import re
+import warnings
 import functools
 import importlib
 from collections.abc import Iterable
@@ -57,6 +58,11 @@ def equivalent_complex_type(x):
 class Vectorizer:
     """Object for mapping a sequence of mixed real/complex n-dimensional arrays
     to a single numpy vector and back and forth.
+
+    Parameters
+    ----------
+    array : sequence of array
+        The set of arrays to map into a single real vector.
     """
 
     def __init__(self, arrays):
@@ -71,6 +77,9 @@ class Vectorizer:
         self.pack(arrays)
 
     def pack(self, arrays, name='vector'):
+        """Take ``arrays`` and pack their values into attribute `.{name}`, by
+        default `.vector`.
+        """
 
         # scipy's optimization routines require real, double data
         if not hasattr(self, name):
@@ -121,37 +130,167 @@ class Vectorizer:
         return arrays
 
 
-def parse_network_to_backend(tn, tags, constant_tags, to_constant):
+_VARIABLE_TAG = "__VARIABLE{}__"
+variable_finder = re.compile(r'__VARIABLE(\d+)__')
+
+
+def _get_tensor_data(t):
+    """Simple function to extract tensor data.
+    """
+    if isinstance(t, PTensor):
+        data = t.params
+    else:
+        data = t.data
+
+    # jax doesn't like numpy.ndarray subclasses...
+    if isinstance(data, qarray):
+        data = data.A
+
+    return data
+
+
+def _parse_opt_in(tn, tags, shared_tags, to_constant):
+    """Parse a tensor network where tensors are assumed to be constant unless
+    tagged.
+    """
     tn_ag = tn.copy()
     variables = []
 
-    variable_tag = "__VARIABLE{}__"
+    # tags where each individual tensor should get a separate variable
+    individual_tags = tags - shared_tags
+
+    # handle tagged tensors that are not shared
+    for t in tn_ag.select_tensors(individual_tags, 'any'):
+        # append the raw data but mark the corresponding tensor
+        # for reinsertion
+        data = _get_tensor_data(t)
+        variables.append(data)
+        t.add_tag(_VARIABLE_TAG.format(len(variables) - 1))
+
+    # handle shared tags
+    for tag in shared_tags:
+
+        var_name = _VARIABLE_TAG.format(len(variables))
+        test_data = None
+
+        for t in tn_ag.select_tensors(tag):
+            data = _get_tensor_data(t)
+
+            # detect that this tensor is already variable tagged and skip
+            # if it is
+            if any(variable_finder.match(tag) for tag in t.tags):
+                warnings.warn('TNOptimizer warning, tensor tagged with'
+                              ' multiple `tags` or `shared_tags`.')
+                continue
+
+            if test_data is None:
+                # create variable and store data
+                variables.append(data)
+                test_data = data
+            else:
+                # check that the shape of the variable's data matches the
+                # data of this new tensor
+                if test_data.shape != data.shape:
+                    raise ValueError('TNOptimizer error, a `shared_tags` tag '
+                                     'covers tensors with different numbers of'
+                                     ' params.')
+
+            # mark the corresponding tensor for reinsertion
+            t.add_tag(var_name)
+
+    # iterate over tensors which *don't* have any of the given tags
+    for t in tn_ag.select_tensors(tags, which='!any'):
+        t.modify(apply=to_constant)
+
+    return tn_ag, variables
+
+
+def _parse_opt_out(tn, constant_tags, to_constant,):
+    """Parse a tensor network where tensors are assumed to be variables unless
+    tagged.
+    """
+    tn_ag = tn.copy()
+    variables = []
 
     for t in tn_ag:
-        # check if tensor has any of the constant tags
+
         if t.tags & constant_tags:
             t.modify(apply=to_constant)
             continue
 
-        # if tags are specified only optimize those tagged
-        if tags and not (t.tags & tags):
-            t.modify(apply=to_constant)
-            continue
-
-        if isinstance(t, PTensor):
-            data = t.params
-        else:
-            data = t.data
-
-        # jax doesn't like numpy.ndarray subclasses...
-        if isinstance(data, qarray):
-            data = data.A
-
-        # append the raw data but mark the corresponding tensor for reinsertion
+        # append the raw data but mark the corresponding tensor
+        # for reinsertion
+        data = _get_tensor_data(t)
         variables.append(data)
-        t.add_tag(variable_tag.format(len(variables) - 1))
+        t.add_tag(_VARIABLE_TAG.format(len(variables) - 1))
 
     return tn_ag, variables
+
+
+def parse_network_to_backend(
+    tn,
+    to_constant,
+    tags=None,
+    shared_tags=None,
+    constant_tags=None,
+):
+    """
+    Parse tensor network to:
+
+        - identify the dimension of the optimisation space and the initial
+          point of the optimisation from the current values in the tensor
+          network,
+        - add variable tags to individual tensors so that optimisation vector
+          values can be efficiently reinserted into the tensor network.
+
+    There are two different modes:
+
+        - 'opt in' : `tags` (and optionally `shared_tags`) are specified and
+          only these tensor tags will be optimised over. In this case
+          `constant_tags` is ignored if it is passed,
+        - 'opt out' : `tags` is not specified. In this case all tensors will be
+          optimised over, unless they have one of `constant_tags` tags.
+
+    Parameters
+    ----------
+    tn : TensorNetwork
+        The initial tensor network to parse.
+    to_constant : Callable
+        Function that fixes a tensor as constant.
+    tags : str, or sequence of str, optional
+        Set of opt-in tags to optimise.
+    shared_tags : str, or sequence of str, optional
+        Subset of opt-in tags to joint optimise i.e. all tensors with tag s in
+        shared_tags will correspond to the same optimisation variables.
+    constant_tags : str, or sequence of str, optional
+        Set of opt-out tags if `tags` not passed.
+
+    Returns
+    -------
+    tn_ag : TensorNetwork
+        Tensor network tagged for reinsertion of optimisation variable values.
+    variables : list
+        List of variables extracted from ``tn``.
+    """
+    tags = tags_to_oset(tags)
+    shared_tags = tags_to_oset(shared_tags)
+    constant_tags = tags_to_oset(constant_tags)
+
+    if tags | shared_tags:
+        # opt_in
+        if not (tags & shared_tags) == shared_tags:
+            tags = tags | shared_tags
+            warnings.warn('TNOptimizer warning, some `shared_tags` are missing'
+                          ' from `tags`. Automatically adding these missing'
+                          ' `shared_tags` to `tags`.')
+        if constant_tags:
+            warnings.warn('TNOptimizer warning, if `tags` or `shared_tags` are'
+                          ' specified then `constant_tags` is ignored - '
+                          'consider instead untagging those tensors.')
+        return _parse_opt_in(tn, tags, shared_tags, to_constant, )
+
+    # opt-out
+    return _parse_opt_out(tn, constant_tags, to_constant, )
 
 
 def constant_t(t, to_constant):
@@ -189,7 +328,12 @@ class AutoGradHandler:
 
     def setup_fn(self, fn):
         autograd = get_autograd()
+        self._backend_fn = fn
         self._value_and_grad = autograd.value_and_grad(fn)
+        self._hvp = autograd.hessian_vector_product(fn)
+
+    def value(self, arrays):
+        return self._backend_fn(arrays)
 
     def value_and_grad(self, arrays):
         loss, grads = self._value_and_grad(arrays)
@@ -219,14 +363,37 @@ class JaxHandler:
     def setup_fn(self, fn):
         jax = get_jax()
         if self.jit_fn:
+            self._backend_fn = jax.jit(fn, backend=self.device)
             self._value_and_grad = jax.jit(
                 jax.value_and_grad(fn), backend=self.device)
         else:
+            self._backend_fn = fn
             self._value_and_grad = jax.value_and_grad(fn)
+
+        self._setup_hessp(fn)
+
+    def _setup_hessp(self, fn):
+        jax = get_jax()
+
+        def hvp(primals, tangents):
+            return jax.jvp(jax.grad(fn), (primals,), (tangents,))[1]
+
+        if self.jit_fn:
+            hvp = jax.jit(hvp, device=self.device)
+
+        self._hvp = hvp
+
+    def value(self, arrays):
+        jax_arrays = tuple(map(self.to_constant, arrays))
+        return to_numpy(self._backend_fn(jax_arrays))
 
     def value_and_grad(self, arrays):
         loss, grads = self._value_and_grad(arrays)
         return loss, [to_numpy(x.conj()) for x in grads]
+
+    def hessp(self, primals, tangents):
+        jax_arrays = self._hvp(primals, tangents)
+        return tuple(map(to_numpy, jax_arrays))
 
 
 @functools.lru_cache(1)
@@ -272,6 +439,10 @@ class TensorFlowHandler:
                 experimental_compile=self.experimental_compile)
         else:
             self._backend_fn = fn
+
+    def value(self, arrays):
+        tf_arrays = tuple(map(self.to_constant, arrays))
+        return to_numpy(self._backend_fn(tf_arrays))
 
     def value_and_grad(self, arrays):
         tf = get_tensorflow()
@@ -327,6 +498,12 @@ class TorchHandler:
         else:
             self._backend_fn = self._fn
 
+    def value(self, arrays):
+        if self._backend_fn is None:
+            self._setup_backend_fn(arrays)
+        torch_arrays = tuple(map(self.to_constant, arrays))
+        return to_numpy(self._backend_fn(torch_arrays))
+
     def value_and_grad(self, arrays):
         torch = get_torch()
 
@@ -346,6 +523,7 @@ class TorchHandler:
 
 
 _BACKEND_HANDLERS = {
+    'numpy': AutoGradHandler,
     'autograd': AutoGradHandler,
     'jax': JaxHandler,
     'tensorflow': TensorFlowHandler,
@@ -409,9 +587,6 @@ class MultiLossHandler:
         return self._value_and_grad_seq(arrays)
 
 
-variable_finder = re.compile(r'__VARIABLE(\d+)__')
-
-
 def inject_(arrays, tn):
     for t in tn:
         for tag in t.tags:
@@ -422,7 +597,7 @@ def inject_(arrays, tn):
                 if isinstance(t, PTensor):
                     t.params = arrays[i]
                 else:
-                    t.modify(data=arrays[i])
+                    t.modify(data=arrays[i], left_inds=t.left_inds)
 
                 break
 
@@ -672,11 +847,11 @@ def parse_constant_arg(arg, to_constant):
     return to_constant(arg)
 
 
-class _MakeArrayFn:
+class MakeArrayFn:
     """Class wrapper so picklable.
     """
 
-    __slots__ = ('tn_opt', 'loss_fn', 'norm_fn', 'autodiff_backend')
+    __name__ = 'MakeArrayFn'
 
     def __init__(self, tn_opt, loss_fn, norm_fn, autodiff_backend):
         self.tn_opt = tn_opt
@@ -728,6 +903,9 @@ class TNOptimizer:
         are assumed to be simple options that don't need conversion).
     tags : str, or sequence of str, optional
         If supplied, only optimize tensors with any of these tags.
+    shared_tags : str, or sequence of str, optional
+        If supplied, each tag in ``shared_tags`` corresponds to a group of
+        tensors to be optimized together.
     constant_tags : str, or sequence of str, optional
         If supplied, skip optimizing tensors with any of these tags.
     loss_target : float, optional
@@ -763,6 +941,7 @@ class TNOptimizer:
         loss_constants=None,
         loss_kwargs=None,
         tags=None,
+        shared_tags=None,
         constant_tags=None,
         loss_target=None,
         optimizer='L-BFGS-B',
@@ -773,8 +952,9 @@ class TNOptimizer:
         **backend_opts
     ):
         self.progbar = progbar
-        self.tags = tags_to_oset(tags)
-        self.constant_tags = tags_to_oset(constant_tags)
+        self.tags = tags
+        self.shared_tags = shared_tags
+        self.constant_tags = constant_tags
 
         if autodiff_backend.upper() == 'AUTO':
             autodiff_backend = _DEFAULT_BACKEND
@@ -794,6 +974,8 @@ class TNOptimizer:
             norm_fn = identity_fn
         self.norm_fn = norm_fn
 
+        self.reset(tn, loss_target=loss_target)
+
         # convert constant arrays ahead of time to correct backend
         self.loss_constants = {
             k: parse_constant_arg(v, self.handler.to_constant)
@@ -810,58 +992,127 @@ class TNOptimizer:
             # loss is all in one
             self.loss_fn = functools.partial(loss_fn, **kws)
 
-        # work out which tensors to optimize and get the underlying data
-        self.tn_opt, self.variables = parse_network_to_backend(
-            tn, self.tags, self.constant_tags, self.handler.to_constant)
-
         # first we wrap the function to convert from array args to TN arg
         #     (i.e. to autodiff library compatible form)
         if self._multiloss:
-            array_fn = [_MakeArrayFn(self.tn_opt, fn, self.norm_fn,
-                                     autodiff_backend) for fn in self.loss_fn]
+            array_fn = [MakeArrayFn(self._tn_opt, fn, self.norm_fn,
+                                    autodiff_backend) for fn in self.loss_fn]
         else:
-            array_fn = _MakeArrayFn(
-                self.tn_opt, self.loss_fn, self.norm_fn, autodiff_backend)
+            array_fn = MakeArrayFn(
+                self._tn_opt, self.loss_fn, self.norm_fn, autodiff_backend)
+
 
         # then we pass it to the handler which generates a function that
         # computes both the value and gradients (still in array form)
         self.handler.setup_fn(array_fn)
 
-        # finally we wrap the function to convert to and from a single vector
-        # from and to array form i.e. scipy optimizer compatible form
+        # options to do with the minimizer
+        self.bounds = bounds
+        self.optimizer = optimizer
 
+    def _set_tn(self, tn):
+        # work out which tensors to optimize and get the underlying data
+        self._tn_opt, variables = parse_network_to_backend(
+            tn,
+            tags=self.tags,
+            shared_tags=self.shared_tags,
+            constant_tags=self.constant_tags,
+            to_constant=self.handler.to_constant
+        )
         # handles storing and packing / unpacking many arrays as a vector
-        self.vectorizer = Vectorizer(self.variables)
+        self.vectorizer = Vectorizer(variables)
 
+    def _reset_tracking_info(self, loss_target=None):
         # tracking info
         self.loss = float('inf')
         self.loss_best = float('inf')
         self.loss_target = loss_target
         self.losses = []
         self._n = 0
+        self._pbar = None
 
-        def vectorized_value_and_grad(x):
-            self.vectorizer.vector[:] = x
-            arrays = self.vectorizer.unpack()
-            ag_result, ag_grads = self.handler.value_and_grad(arrays)
-            self._n += 1
-            self.loss = ag_result.item()
-            self.losses.append(self.loss)
-            vec_grad = self.vectorizer.pack(ag_grads, 'grad')
-            return self.loss, vec_grad
+    def reset(self, tn=None, clear_info=True, loss_target=None):
+        """Reset this optimizer without losing the compiled loss and gradient
+        functions.
 
-        self.vectorized_value_and_grad = vectorized_value_and_grad
+        Parameters
+        ----------
+        tn : TensorNetwork, optional
+            Set this tensor network as the current state of the optimizer, it
+            must exactly match the original tensor network.
+        clear_info : bool, optional
+            Clear the tracked losses and iterations.
+        """
+        if tn is not None:
+            self._set_tn(tn)
+        if clear_info:
+            self._reset_tracking_info(loss_target=loss_target)
 
-        if bounds is not None:
-            bounds = np.array((bounds,) * self.vectorizer.d)
-        self.bounds = bounds
+    def _maybe_init_pbar(self, n):
+        if self.progbar:
+            self._pbar = tqdm.tqdm(total=n)
 
-        # options to do with the scipy minimizer
-        self.optimizer = optimizer
+    def _maybe_update_pbar(self):
+        if self._pbar is not None:
+            self._pbar.update()
+            self.loss_best = min(self.loss_best, self.loss)
+            msg = f"{self.loss:+.12f} [best: {self.loss_best:+.12f}] "
+            self._pbar.set_description(msg)
+
+    def _maybe_close_pbar(self):
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
+
+    def _check_loss_target(self):
+        if (self.loss_target is not None) and (self.loss <= self.loss_target):
+            # for scipy terminating optimizer with callback doesn't work
+            raise KeyboardInterrupt
+
+    def vectorized_value(self, x):
+        """The value of the loss function at vector ``x``.
+        """
+        self.vectorizer.vector[:] = x
+        arrays = self.vectorizer.unpack()
+        self.loss = self.handler.value(arrays).item()
+        self.losses.append(self.loss)
+        self._n += 1
+        self._maybe_update_pbar()
+        self._check_loss_target()
+        return self.loss
+
+    def vectorized_value_and_grad(self, x):
+        """The value and gradient of the loss function at vector ``x``.
+        """
+        self.vectorizer.vector[:] = x
+        arrays = self.vectorizer.unpack()
+        result, grads = self.handler.value_and_grad(arrays)
+        self._n += 1
+        self.loss = result.item()
+        self.losses.append(self.loss)
+        vec_grad = self.vectorizer.pack(grads, 'grad')
+        self._maybe_update_pbar()
+        self._check_loss_target()
+        return self.loss, vec_grad
+
+    def vectorized_hessp(self, x, p):
+        """The action of the hessian at point ``x`` on vector ``p``.
+        """
+        primals = self.vectorizer.unpack(x)
+        tangents = self.vectorizer.unpack(p)
+        hp_arrays = self.handler.hessp(primals, tangents)
+        self._n += 1
+        self.losses.append(self.loss)
+        self._maybe_update_pbar()
+        return self.vectorizer.pack(hp_arrays, 'hp')
 
     def __repr__(self):
-        return (f"<TNOptimizer(d={self.vectorizer.d}, "
+        return (f"<TNOptimizer(d={self.d}, "
                 f"backend={self._autodiff_backend})>")
+
+    @property
+    def d(self):
+        return int(self.vectorizer.d)
 
     @property
     def nevals(self):
@@ -871,6 +1122,8 @@ class TNOptimizer:
 
     @property
     def optimizer(self):
+        """The underlying optimizer that works with the vectorized functions.
+        """
         return self._optimizer
 
     @optimizer.setter
@@ -881,80 +1134,152 @@ class TNOptimizer:
         else:
             self._method = self.optimizer
 
-    def inject_res_vector_and_return_tn(self):
-        arrays = self.vectorizer.unpack()
-        inject_(arrays, self.tn_opt)
-        tn = self.norm_fn(self.tn_opt.copy())
+    @property
+    def bounds(self):
+        return self._bounds
+
+    @bounds.setter
+    def bounds(self, x):
+        if x is not None:
+            self._bounds = np.array((x,) * self.vectorizer.d)
+        else:
+            self._bounds = None
+
+    def get_tn_opt(self):
+        """Extract the optimized tensor network, this is a three part process:
+
+            1. inject the current optimized vector into the target tensor
+               network,
+            2. run it through ``norm_fn``,
+            3. drop any tags used to identify variables.
+
+        Returns
+        -------
+        tn_opt : TensorNetwork
+        """
+        arrays = tuple(map(self.handler.to_constant, self.vectorizer.unpack()))
+        inject_(arrays, self._tn_opt)
+        tn = self.norm_fn(self._tn_opt.copy())
         tn.drop_tags(t for t in tn.tags if variable_finder.match(t))
-        tn.apply_to_arrays(to_numpy)
+
+        for t in tn:
+            if isinstance(t, PTensor):
+                t.params = to_numpy(t.params)
+            else:
+                t.modify(data=to_numpy(t.data), left_inds=t.left_inds)
+
         return tn
 
-    def optimize(self, n, tol=None, **options):
+    def optimize(
+        self,
+        n,
+        tol=None,
+        jac=True,
+        hessp=False,
+        **options
+    ):
+        """Run the optimizer for ``n`` function evaluations, using
+        :func:`scipy.optimize.minimize` as the driver for the vectorized
+        computation. Supplying the gradient and hessian vector product is
+        controlled by the ``jac`` and ``hessp`` options respectively.
+
+        Parameters
+        ----------
+        n : int
+            Notionally the maximum number of iterations for the optimizer, note
+            that depending on the optimizer being used, this may correspond to
+            number of function evaluations rather than just iterations.
+        tol : None or float, optional
+            Tolerance for convergence, note that various more specific
+            tolerances can usually be supplied to ``options``, depending on
+            the optimizer being used.
+        jac : bool, optional
+            Whether to supply the jacobian, i.e. gradient, of the loss
+            function.
+        hessp : bool, optional
+            Whether to supply the hessian vector product of the loss function.
+        options
+            Supplied to :func:`scipy.optimize.minimize`.
+
+        Returns
+        -------
+        tn_opt : TensorNetwork
+        """
         from scipy.optimize import minimize
 
+        if jac:
+            fun = self.vectorized_value_and_grad
+        else:
+            fun = self.vectorized_value
+
         try:
-            pbar = tqdm.tqdm(total=n, disable=not self.progbar)
-
-            def callback(_):
-                pbar.update()
-                pbar.set_description(f"{self.loss}")
-
-                if self.loss_target is not None:
-                    if self.loss < self.loss_target:
-                        # returning True doesn't terminate optimization
-                        raise KeyboardInterrupt
-
+            self._maybe_init_pbar(n)
             self.res = minimize(
-                fun=self.vectorized_value_and_grad,
-                jac=True,
+                fun=fun,
+                jac=jac,
+                hessp=self.vectorized_hessp if hessp else None,
                 x0=self.vectorizer.vector,
-                callback=callback,
                 tol=tol,
                 bounds=self.bounds,
                 method=self._method,
                 options=dict(maxiter=n, **options),
             )
             self.vectorizer.vector[:] = self.res.x
-
         except KeyboardInterrupt:
             pass
         finally:
-            pbar.close()
+            self._maybe_close_pbar()
 
-        return self.inject_res_vector_and_return_tn()
+        return self.get_tn_opt()
 
-    def optimize_basinhopping(self, n, nhop, temperature=1.0, **options):
+    def optimize_basinhopping(
+        self,
+        n,
+        nhop,
+        temperature=1.0,
+        jac=True,
+        hessp=False,
+        **options
+    ):
+        """Run the optimizer for using :func:`scipy.optimize.basinhopping`
+        as the driver for the vectorized computation. This performs ``nhop``
+        local optimization each with ``n`` iterations.
+
+        Parameters
+        ----------
+        n : int
+            Number of iterations per local optimization.
+        nhop : int
+            Number of local optimizations to hop between.
+        temperature : float, optional
+            H
+        options
+            Supplied to the inner :func:`scipy.optimize.minimize` call.
+
+        Returns
+        -------
+        tn_opt : TensorNetwork
+        """
         from scipy.optimize import basinhopping
 
+        if jac:
+            fun = self.vectorized_value_and_grad
+        else:
+            fun = self.vectorized_value
+
         try:
-            pbar = tqdm.tqdm(total=n * nhop, disable=not self.progbar)
-
-            def hop_callback(_, f, accept):
-                pass
-
-            def inner_callback(_):
-                self.loss_best = min(self.loss_best, self.loss)
-                pbar.update()
-                msg = f"{self.loss} [best: {self.loss_best}] "
-                pbar.set_description(msg)
-
-                if self.loss_target is not None:
-                    if self.loss_best < self.loss_target:
-                        # returning True doesn't terminate optimization
-                        raise KeyboardInterrupt
-
+            self._maybe_init_pbar(n * nhop)
             self.res = basinhopping(
-                func=self.vectorized_value_and_grad,
+                func=fun,
                 x0=self.vectorizer.vector,
                 niter=nhop,
                 minimizer_kwargs=dict(
-                    jac=True,
-                    method=self.optimizer,
+                    jac=jac,
+                    hessp=self.vectorized_hessp if hessp else None,
+                    method=self._method,
                     bounds=self.bounds,
-                    callback=inner_callback,
                     options=dict(maxiter=n, **options)
                 ),
-                callback=hop_callback,
                 T=temperature,
             )
             self.vectorizer.vector[:] = self.res.x
@@ -962,6 +1287,165 @@ class TNOptimizer:
         except KeyboardInterrupt:
             pass
         finally:
-            pbar.close()
+            self._maybe_close_pbar()
 
-        return self.inject_res_vector_and_return_tn()
+        return self.get_tn_opt()
+
+    def optimize_nlopt(
+        self,
+        n,
+        ftol_rel=None,
+        ftol_abs=None,
+        xtol_rel=None,
+        xtol_abs=None,
+    ):
+        """Run the optimizer for ``n`` function evaluations, using ``nlopt`` as
+        the backend library to run the optimization. Whether the gradient is
+        computed depends on which ``optimizer`` is selected, see valid options
+        at  https://nlopt.readthedocs.io/en/latest/NLopt_Algorithms/.
+
+        Parameters
+        ----------
+        n : int
+            The maximum number of iterations for the optimizer.
+        ftol_rel : float, optional
+            Set relative tolerance on function value.
+        ftol_abs : float, optional
+            Set absolute tolerance on function value.
+        xtol_rel : float, optional
+            Set relative tolerance on optimization parameters.
+        xtol_abs : float, optional
+            Set absolute tolerances on optimization parameters.
+
+        Returns
+        -------
+        tn_opt : TensorNetwork
+        """
+        import nlopt
+
+        try:
+            self._maybe_init_pbar(n)
+
+            def f(x, grad):
+                self.vectorizer.vector[:] = x
+                arrays = self.vectorizer.unpack()
+                if grad.size > 0:
+                    result, grads = self.handler.value_and_grad(arrays)
+                    grad[:] = self.vectorizer.pack(grads, 'grad')
+                else:
+                    result = self.handler.value(arrays)
+                self._n += 1
+                self.loss = result.item()
+                self.losses.append(self.loss)
+                self._maybe_update_pbar()
+                return self.loss
+
+            opt = nlopt.opt(getattr(nlopt, self.optimizer), self.d)
+            opt.set_min_objective(f)
+            opt.set_maxeval(n)
+
+            if self.bounds is not None:
+                opt.set_lower_bounds(self.bounds[:, 0])
+                opt.set_upper_bounds(self.bounds[:, 1])
+
+            if self.loss_target is not None:
+                opt.set_stopval(self.loss_target)
+            if ftol_rel is not None:
+                opt.set_ftol_rel(ftol_rel)
+            if ftol_abs is not None:
+                opt.set_ftol_abs(ftol_abs)
+            if xtol_rel is not None:
+                opt.set_xtol_rel(xtol_rel)
+            if xtol_abs is not None:
+                opt.set_xtol_abs(xtol_abs)
+
+            self.vectorizer.vector[:] = opt.optimize(self.vectorizer.vector)
+
+        except (KeyboardInterrupt, RuntimeError):
+            pass
+        finally:
+            self._maybe_close_pbar()
+
+        return self.get_tn_opt()
+
+    def optimize_ipopt(self, n, tol=None, **options):
+        """Run the optimizer for ``n`` function evaluations, using ``ipopt`` as
+        the backend library to run the optimization via the python package
+        ``cyipopt``.
+
+        Parameters
+        ----------
+        n : int
+            The maximum number of iterations for the optimizer.
+
+        Returns
+        -------
+        tn_opt : TensorNetwork
+        """
+        from cyipopt import minimize_ipopt
+
+        try:
+            self._maybe_init_pbar(n)
+            self.res = minimize_ipopt(
+                fun=self.vectorized_value_and_grad,
+                jac=True,
+                x0=self.vectorizer.vector,
+                tol=tol,
+                bounds=self.bounds,
+                method=self._method,
+                options=dict(maxiter=n, **options),
+            )
+            self.vectorizer.vector[:] = self.res.x
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._maybe_close_pbar()
+
+        return self.get_tn_opt()
+
+    def optimize_nevergrad(self, n):
+        """Run the optimizer for ``n`` function evaluations, using
+        ``nevergrad`` as the backend library to run the optimization. As the
+        name suggests, the gradient is not required for this method.
+
+        Parameters
+        ----------
+        n : int
+            The maximum number of iterations for the optimizer.
+
+        Returns
+        -------
+        tn_opt : TensorNetwork
+        """
+        import nevergrad as ng
+
+        opt = getattr(ng.optimizers, self.optimizer)(
+            parametrization=ng.p.Array(
+                init=self.vectorizer.vector,
+                lower=self.bounds[:, 0] if self.bounds is not None else None,
+                upper=self.bounds[:, 1] if self.bounds is not None else None,
+            ),
+            budget=n
+        )
+
+        try:
+            self._maybe_init_pbar(n)
+            for _ in range(n):
+                x = opt.ask()
+                loss = self.vectorized_value(*x.args, **x.kwargs)
+                opt.tell(x, loss)
+                if self.loss_target is not None:
+                    if self.loss < self.loss_target:
+                        break
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._maybe_close_pbar()
+
+        # recommendation = opt.minimize(self.vectorized_value)
+        recommendation = opt.provide_recommendation()
+        self.vectorizer.vector[:] = recommendation.value
+
+        return self.get_tn_opt()
+

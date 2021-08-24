@@ -1,13 +1,15 @@
 import math
 import numbers
+import operator
 import functools
+import itertools
 
 import numpy as np
 from autoray import do, reshape
 
 import quimb as qu
 from ..utils import progbar as _progbar
-from ..utils import oset, partitionby, concatv, partition_all, ensure_dict
+from ..utils import oset, partitionby, concatv, partition_all, ensure_dict, LRU
 from .tensor_core import (get_tags, tags_to_oset, oset_union, tensor_contract,
                           PTensor, Tensor, TensorNetwork, rand_uuid)
 from .tensor_gen import MPS_computational_state
@@ -417,7 +419,7 @@ def apply_fsim(psi, theta, phi, i, j, parametrize=False, **gate_opts):
 
 
 def fsimg_param_gen(params):
-    theta, Zeta, chi, gamma, phi = (
+    theta, zeta, chi, gamma, phi = (
         params[0], params[1], params[2], params[3], params[4]
     )
 
@@ -425,7 +427,7 @@ def fsimg_param_gen(params):
     a11_im = do('imag', a11_re)
     a11 = do('complex', a11_re, a11_im)
 
-    e11_im = -(gamma + Zeta)
+    e11_im = -(gamma + zeta)
     e11_re = do('imag', e11_im)
     e11 = do('exp', do('complex', e11_re, e11_im))
 
@@ -433,7 +435,7 @@ def fsimg_param_gen(params):
     a22_im = do('imag', a22_re)
     a22 = do('complex', a22_re, a22_im)
 
-    e22_im = -(gamma - Zeta)
+    e22_im = -(gamma - zeta)
     e22_re = do('imag', e22_im)
     e22 = do('exp', do('complex', e22_re, e22_im))
 
@@ -471,15 +473,15 @@ def fsimg_param_gen(params):
 
 def apply_fsimg(
     psi,
-    theta, Zeta, chi, gamma, phi,
+    theta, zeta, chi, gamma, phi,
     i, j, parametrize=False, **gate_opts
 ):
 
     mtags = _merge_tags('FSIMG', gate_opts)
     if parametrize:
-        G = ops.PArray(fsimg_param_gen, (theta, Zeta, chi, gamma, phi))
+        G = ops.PArray(fsimg_param_gen, (theta, zeta, chi, gamma, phi))
     else:
-        G = qu.fsimg(theta, Zeta, chi, gamma, phi)
+        G = qu.fsimg(theta, zeta, chi, gamma, phi)
     psi.gate_(G, (int(i), int(j)), tags=mtags, **gate_opts)
 
 
@@ -813,6 +815,21 @@ class Circuit:
         qc.apply_gates(info['gates'])
         return qc
 
+    def apply_gate_raw(self, U, where, tags=None,
+                       gate_round=None, **gate_opts):
+        """Apply the raw array ``U`` as a gate on qubits in ``where``. It will
+        be assumed to be unitary for the sake of computing reverse lightcones.
+        """
+        tags = (
+            tags_to_oset(tags) |
+            tags_to_oset(f'GATE_{len(self.gates)}')
+        )
+        if (gate_round is not None):
+            tags.add(f'ROUND_{gate_round}')
+        opts = {**self.gate_opts, **gate_opts}
+        self._psi.gate_(U, where, tags=tags, **opts)
+        self.gates.append((id(U), *where))
+
     def apply_gate(self, gate_id, *gate_args, gate_round=None, **gate_opts):
         """Apply a single gate to this tensor network quantum circuit. If
         ``gate_round`` is supplied the tensor(s) added will be tagged with
@@ -988,9 +1005,9 @@ class Circuit:
         self.apply_gate('FSIM', theta, phi, i, j,
                         gate_round=gate_round, parametrize=parametrize)
 
-    def fsimg(self, theta, Zeta, chi, gamma, phi, i, j,
+    def fsimg(self, theta, zeta, chi, gamma, phi, i, j,
               gate_round=None, parametrize=False):
-        self.apply_gate('FSIMG', theta, Zeta, chi, gamma, phi, i, j,
+        self.apply_gate('FSIMG', theta, zeta, chi, gamma, phi, i, j,
                         gate_round=gate_round, parametrize=parametrize)
 
     def rzz(self, theta, i, j, gate_round=None, parametrize=False):
@@ -1028,24 +1045,29 @@ class Circuit:
         psi.astype_(psi.dtype)
         return psi
 
-    @property
-    def uni(self):
+    def get_uni(self, transposed=False):
         """Tensor network representation of the unitary operator (i.e. with
         the initial state removed).
         """
         U = self.psi
 
-        # rename the initial state rand_uuid bonds to 1D site inds
-        ixmap = {self.ket_site_ind(i): self.bra_site_ind(i)
-                 for i in range(self.N)}
+        if transposed:
+            # rename the initial state rand_uuid bonds to 1D site inds
+            ixmap = {self.ket_site_ind(i): self.bra_site_ind(i)
+                     for i in range(self.N)}
+        else:
+            ixmap = {}
 
         # the first `N` tensors should be the tensors of input state
         tids = tuple(U.tensor_map)[:self.N]
         for i, tid in enumerate(tids):
             t = U._pop_tensor(tid)
-            assert U.site_tag(i) in t.tags
             old_ix, = t.inds
-            ixmap[old_ix] = f'k{i}'
+
+            if transposed:
+                ixmap[old_ix] = f'k{i}'
+            else:
+                ixmap[old_ix] = f'b{i}'
 
         U.reindex_(ixmap)
         U.view_as_(
@@ -1055,6 +1077,18 @@ class Circuit:
         )
 
         return U
+
+    @property
+    def uni(self):
+        import warnings
+        warnings.warn(
+            "In future the tensor network returned by ``circ.uni`` will not "
+            "be transposed as it is currently, to match the expectation from "
+            "``U = circ.uni.to_dense()`` behaving like ``U @ psi``. You can "
+            "retain this behaviour with ``circ.get_uni(transposed=True)``.",
+            FutureWarning
+        )
+        return self.get_uni(transposed=True)
 
     def get_reverse_lightcone_tags(self, where):
         """Get the tags of gates in this circuit corresponding to the 'reverse'
@@ -1188,7 +1222,12 @@ class Circuit:
         self._storage[key] = sc
         return sc
 
-    def get_psi_simplified(self, seq='ADCRS', atol=1e-12):
+    def get_psi_simplified(
+        self,
+        seq='ADCRS',
+        atol=1e-12,
+        equalize_norms=False
+    ):
         """Get the full wavefunction post local tensor network simplification.
 
         Parameters
@@ -1200,6 +1239,8 @@ class Circuit:
         atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
 
         Returns
         -------
@@ -1216,13 +1257,20 @@ class Circuit:
         output_inds = tuple(map(psi.site_ind, range(self.N)))
 
         # simplify the state and cache it
-        psi.full_simplify_(seq=seq, atol=atol, output_inds=output_inds)
+        psi.full_simplify_(seq=seq, atol=atol, output_inds=output_inds,
+                           equalize_norms=equalize_norms)
         self._storage[key] = psi
 
         # return a copy so we can modify it inplace
         return psi.copy()
 
-    def get_rdm_lightcone_simplified(self, where, seq='ADCRS', atol=1e-12):
+    def get_rdm_lightcone_simplified(
+        self,
+        where,
+        seq='ADCRS',
+        atol=1e-12,
+        equalize_norms=False,
+    ):
         """Get a simplified TN of the norm of the wavefunction, with
         gates outside reverse lightcone of ``where`` cancelled, and physical
         indices within ``where`` preserved so that they can be fixed (sliced)
@@ -1241,6 +1289,8 @@ class Circuit:
         atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
 
         Returns
         -------
@@ -1262,7 +1312,8 @@ class Circuit:
         output_inds = b_inds + k_inds
 
         # # simplify the norm and cache it
-        rho_lc.full_simplify_(seq=seq, atol=atol, output_inds=output_inds)
+        rho_lc.full_simplify_(seq=seq, atol=atol, output_inds=output_inds,
+                              equalize_norms=equalize_norms)
         self._storage[key] = rho_lc
 
         # return a copy so we can modify it inplace
@@ -1274,6 +1325,7 @@ class Circuit:
         optimize='auto-hq',
         simplify_sequence='ADCRS',
         simplify_atol=1e-12,
+        simplify_equalize_norms=False,
         backend='auto',
         dtype='complex128',
         target_size=None,
@@ -1300,6 +1352,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         backend : str, optional
             Backend to perform the contraction with, e.g. ``'numpy'``,
             ``'cupy'`` or ``'jax'``. Passed to ``opt_einsum``.
@@ -1310,10 +1364,10 @@ class Circuit:
             contraction involves tensors bigger than this, 'slice' the
             contraction into independent parts and sum them individually.
             Requires ``cotengra`` currently.
-        rehearse : bool, optional
+        rehearse : bool or "tn", optional
             If ``True``, generate and cache the simplified tensor network and
             contraction path but don't actually perform the contraction.
-            Returns a dict with keys ``'tn'`` and ``'info'`` with the tensor
+            Returns a dict with keys ``"tn"`` and ``'info'`` with the tensor
             network that will be contracted and the corresponding contraction
             path if so.
         """
@@ -1323,17 +1377,25 @@ class Circuit:
             raise ValueError(f"Bit-string {b} length does not "
                              f"match number of qubits {self.N}.")
 
+        fs_opts = {
+            'seq': simplify_sequence,
+            'atol': simplify_atol,
+            'equalize_norms': simplify_equalize_norms,
+        }
+
         # get the full wavefunction simplified
-        psi_b = self.get_psi_simplified(
-            seq=simplify_sequence, atol=simplify_atol)
+        psi_b = self.get_psi_simplified(**fs_opts)
 
         # fix the output indices to the correct bitstring
         for i, x in zip(range(self.N), b):
             psi_b.isel_({psi_b.site_ind(i): int(x)})
 
         # perform a final simplification and cast
-        psi_b.full_simplify_(seq=simplify_sequence, atol=simplify_atol)
+        psi_b.full_simplify_(**fs_opts)
         psi_b.astype_(dtype)
+
+        if rehearse == "tn":
+            return psi_b
 
         # get the contraction path info
         info = psi_b.contract(
@@ -1361,8 +1423,10 @@ class Circuit:
         b='random',
         simplify_sequence='ADCRS',
         simplify_atol=1e-12,
+        simplify_equalize_norms=False,
         optimize='auto-hq',
         dtype='complex128',
+        rehearse=True,
     ):
         """Perform just the tensor network simplifications and contraction path
         finding associated with computing a single amplitude (caching the
@@ -1384,6 +1448,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         backend : str, optional
             Backend to perform the marginal contraction with, e.g. ``'numpy'``,
             ``'cupy'`` or ``'jax'``. Passed to ``opt_einsum``.
@@ -1400,8 +1466,13 @@ class Circuit:
             b = [random.choice('01') for _ in range(self.N)]
 
         return self.amplitude(
-            b=b, optimize=optimize, dtype=dtype, rehearse=True,
-            simplify_sequence=simplify_sequence, simplify_atol=simplify_atol)
+            b=b, optimize=optimize, dtype=dtype, rehearse=rehearse,
+            simplify_sequence=simplify_sequence,
+            simplify_atol=simplify_atol,
+            simplify_equalize_norms=simplify_equalize_norms
+        )
+
+    amplitude_tn = functools.partialmethod(amplitude_rehearse, rehearse="tn")
 
     def partial_trace(
         self,
@@ -1409,6 +1480,7 @@ class Circuit:
         optimize='auto-hq',
         simplify_sequence='ADCRS',
         simplify_atol=1e-12,
+        simplify_equalize_norms=False,
         backend='auto',
         dtype='complex128',
         target_size=None,
@@ -1443,6 +1515,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         backend : str, optional
             Backend to perform the marginal contraction with, e.g. ``'numpy'``,
             ``'cupy'`` or ``'jax'``. Passed to ``opt_einsum``.
@@ -1453,10 +1527,10 @@ class Circuit:
             contraction involves tensors bigger than this, 'slice' the
             contraction into independent parts and sum them individually.
             Requires ``cotengra`` currently.
-        rehearse : bool, optional
+        rehearse : bool or "tn", optional
             If ``True``, generate and cache the simplified tensor network and
             contraction path but don't actually perform the contraction.
-            Returns a dict with keys ``'tn'`` and ``'info'`` with the tensor
+            Returns a dict with keys ``"tn"`` and ``'info'`` with the tensor
             network that will be contracted and the corresponding contraction
             path if so.
 
@@ -1472,8 +1546,12 @@ class Circuit:
                        tuple(map(self.bra_site_ind, keep)))
 
         rho = self.get_rdm_lightcone_simplified(
-            keep, simplify_sequence, simplify_atol
+            where=keep, seq=simplify_sequence, atol=simplify_atol,
+            equalize_norms=simplify_equalize_norms,
         ).astype_(dtype)
+
+        if rehearse == "tn":
+            return rho
 
         info = rho.contract(
             all,
@@ -1501,6 +1579,8 @@ class Circuit:
 
     partial_trace_rehearse = functools.partialmethod(
         partial_trace, rehearse=True)
+    partial_trace_tn = functools.partialmethod(
+        partial_trace, rehearse="tn")
 
     def local_expectation(
         self,
@@ -1509,6 +1589,7 @@ class Circuit:
         optimize='auto-hq',
         simplify_sequence='ADCRS',
         simplify_atol=1e-12,
+        simplify_equalize_norms=False,
         backend='auto',
         dtype='complex128',
         target_size=None,
@@ -1543,6 +1624,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         backend : str, optional
             Backend to perform the marginal contraction with, e.g. ``'numpy'``,
             ``'cupy'`` or ``'jax'``. Passed to ``opt_einsum``.
@@ -1555,7 +1638,7 @@ class Circuit:
             Requires ``cotengra`` currently.
         gate_opts : None or dict_like
             Options to use when applying ``G`` to the wavefunction.
-        rehearse : bool, optional
+        rehearse : bool or "tn", optional
             If ``True``, generate and cache the simplified tensor network and
             contraction path but don't actually perform the contraction.
             Returns a dict with keys ``'tn'`` and ``'info'`` with the tensor
@@ -1569,16 +1652,20 @@ class Circuit:
         if isinstance(where, numbers.Integral):
             where = (where,)
 
-        rho = self.get_rdm_lightcone_simplified(
-            where, simplify_sequence, simplify_atol
-        )
+        fs_opts = {
+            'seq': simplify_sequence,
+            'atol': simplify_atol,
+            'equalize_norms': simplify_equalize_norms,
+        }
+
+        rho = self.get_rdm_lightcone_simplified(where=where, **fs_opts)
         k_inds = tuple(self.ket_site_ind(i) for i in where)
         b_inds = tuple(self.bra_site_ind(i) for i in where)
 
         if isinstance(G, (list, tuple)):
             # if we have multiple expectations create an extra indexed stack
             nG = len(G)
-            G_data = do('stack', G, like=G[0])
+            G_data = do('stack', G)
             G_data = reshape(G_data, (nG,) + (2,) * 2 * len(where))
             output_inds = (rand_uuid(),)
         else:
@@ -1589,12 +1676,11 @@ class Circuit:
 
         rhoG = rho | TG
 
-        rhoG.full_simplify_(
-            seq=simplify_sequence,
-            atol=simplify_atol,
-            output_inds=output_inds,
-        )
+        rhoG.full_simplify_(output_inds=output_inds, **fs_opts)
         rhoG.astype_(dtype)
+
+        if rehearse == "tn":
+            return rhoG
 
         info = rhoG.contract(
             all,
@@ -1622,6 +1708,8 @@ class Circuit:
 
     local_expectation_rehearse = functools.partialmethod(
         local_expectation, rehearse=True)
+    local_expectation_tn = functools.partialmethod(
+        local_expectation, rehearse="tn")
 
     def compute_marginal(
         self,
@@ -1632,6 +1720,7 @@ class Circuit:
         dtype='complex64',
         simplify_sequence='ADCRS',
         simplify_atol=1e-6,
+        simplify_equalize_norms=True,
         target_size=None,
         rehearse=False,
     ):
@@ -1661,7 +1750,9 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
-        rehearse : bool, optional
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
+        rehearse : bool or "tn", optional
             Whether to perform the marginal contraction or just return the
             associated TN and contraction path information.
         target_size : None or int, optional
@@ -1676,7 +1767,11 @@ class Circuit:
         # rho_ii -> p_i (i.e. insert a COPY tensor into the norm)
         output_inds = [self.ket_site_ind(i) for i in where]
 
-        fs_opts = dict(seq=simplify_sequence, atol=simplify_atol)
+        fs_opts = {
+            'seq': simplify_sequence,
+            'atol': simplify_atol,
+            'equalize_norms': simplify_equalize_norms,
+        }
 
         # lightcone region is target qubit plus fixed qubits
         region = set(where)
@@ -1708,14 +1803,18 @@ class Circuit:
         nm_lc.full_simplify_(output_inds=output_inds, **fs_opts)
 
         # for stability with very small probabilities, scale by average prob
-        nfact = 2**len(fix)
-        if final_marginal:
-            nm_lc.multiply_(nfact**0.5, spread_over='all')
-        else:
-            nm_lc.multiply_(nfact, spread_over='all')
+        if fix is not None:
+            nfact = 2**len(fix)
+            if final_marginal:
+                nm_lc.multiply_(nfact**0.5, spread_over='all')
+            else:
+                nm_lc.multiply_(nfact, spread_over='all')
 
         # cast to desired data type
         nm_lc.astype_(dtype)
+
+        if rehearse == "tn":
+            return nm_lc
 
         # NB. the path isn't *neccesarily* the same each time due to the post
         #     slicing full simplify, however there is also the lower level
@@ -1727,7 +1826,7 @@ class Circuit:
         )
 
         if rehearse:
-            return nm_lc, info
+            return rehearsal_dict(nm_lc, info)
 
         if target_size is not None:
             # perform the 'sliced' contraction restricted to ``target_size``
@@ -1745,7 +1844,15 @@ class Circuit:
             # we only did half the ket contraction so need to square
             p_marginal = p_marginal**2
 
-        return p_marginal / nfact
+        if fix is not None:
+            p_marginal /= nfact
+
+        return p_marginal
+
+    compute_marginal_rehearse = functools.partialmethod(
+        compute_marginal, rehearse=True)
+    compute_marginal_tn = functools.partialmethod(
+        compute_marginal, rehearse="tn")
 
     def calc_qubit_ordering(self, qubits=None):
         """Get a order to measure ``qubits`` in, by greedily choosing whichever
@@ -1826,6 +1933,7 @@ class Circuit:
         dtype='complex64',
         simplify_sequence='ADCRS',
         simplify_atol=1e-6,
+        simplify_equalize_norms=False,
         target_size=None,
     ):
         r"""Sample the circuit given by ``gates``, ``C`` times, using lightcone
@@ -1910,6 +2018,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         target_size : None or int, optional
             The largest size of tensor to allow. If specified and any
             contraction involves tensors bigger than this, 'slice' the
@@ -1953,6 +2063,7 @@ class Circuit:
                         dtype=dtype,
                         simplify_sequence=simplify_sequence,
                         simplify_atol=simplify_atol,
+                        simplify_equalize_norms=simplify_equalize_norms,
                         target_size=target_size,
                     )
                     p = do('to_numpy', p).astype('float64')
@@ -1983,6 +2094,8 @@ class Circuit:
         optimize='auto-hq',
         simplify_sequence='ADCRS',
         simplify_atol=1e-6,
+        simplify_equalize_norms=False,
+        rehearse=True,
         progbar=False,
     ):
         """Perform the preparations and contraction path findings for
@@ -2018,6 +2131,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         progbar : bool, optional
             Whether to show the progress of finding each contraction path.
 
@@ -2042,21 +2157,23 @@ class Circuit:
         tns_and_infos = {}
 
         for where in _progbar(groups, disable=not progbar):
-            tn, info = self.compute_marginal(
+            tns_and_infos[where] = self.compute_marginal(
                 where=where,
                 fix=fix,
                 optimize=optimize,
                 simplify_sequence=simplify_sequence,
-                rehearse=True,
+                simplify_atol=simplify_atol,
+                simplify_equalize_norms=simplify_equalize_norms,
+                rehearse=rehearse,
             )
-
-            tns_and_infos[where] = rehearsal_dict(tn, info)
 
             # set the result of qubit ``q`` arbitrarily
             for q in where:
                 fix[q] = result[q]
 
         return tns_and_infos
+
+    sample_tns = functools.partialmethod(sample_rehearse, rehearse="tn")
 
     def sample_chaotic(
         self,
@@ -2069,6 +2186,7 @@ class Circuit:
         dtype='complex64',
         simplify_sequence='ADCRS',
         simplify_atol=1e-6,
+        simplify_equalize_norms=False,
         target_size=None,
     ):
         r"""Sample from this circuit, *assuming* it to be chaotic. Which is to
@@ -2123,6 +2241,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         target_size : None or int, optional
             The largest size of tensor to allow. If specified and any
             contraction involves tensors bigger than this, 'slice' the
@@ -2167,6 +2287,7 @@ class Circuit:
                     dtype=dtype,
                     simplify_sequence=simplify_sequence,
                     simplify_atol=simplify_atol,
+                    simplify_equalize_norms=simplify_equalize_norms,
                     target_size=target_size,
                 )
                 p = do('to_numpy', p).astype('float64')
@@ -2195,7 +2316,9 @@ class Circuit:
         optimize='auto-hq',
         simplify_sequence='ADCRS',
         simplify_atol=1e-6,
+        simplify_equalize_norms=False,
         dtype='complex64',
+        rehearse=True,
     ):
         """Rehearse chaotic sampling (perform just the TN simplifications and
         contraction path finding).
@@ -2220,6 +2343,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         dtype : str, optional
             Data type to cast the TN to before contraction.
 
@@ -2247,17 +2372,24 @@ class Circuit:
         else:
             fix = {q: result[q] for q in fix_qubits}
 
-        tn, info = self.compute_marginal(
+        rehs = self.compute_marginal(
             where=where,
             fix=fix,
             optimize=optimize,
             simplify_sequence=simplify_sequence,
             simplify_atol=simplify_atol,
+            simplify_equalize_norms=simplify_equalize_norms,
             dtype=dtype,
-            rehearse=True,
+            rehearse=rehearse,
         )
 
-        return {where: rehearsal_dict(tn, info)}
+        if rehearse == "tn":
+            return rehs
+
+        return {where: rehs}
+
+    sample_chaotic_tn = functools.partialmethod(
+        sample_chaotic_rehearse, rehearse="tn")
 
     def to_dense(
         self,
@@ -2265,6 +2397,7 @@ class Circuit:
         optimize='auto-hq',
         simplify_sequence='R',
         simplify_atol=1e-12,
+        simplify_equalize_norms=False,
         backend='auto',
         dtype=None,
         target_size=None,
@@ -2290,6 +2423,8 @@ class Circuit:
         simplify_atol : float, optional
             The tolerance with which to compare to zero when applying
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_equalize_norms : bool, optional
+            Actively renormalize tensor norms during simplification.
         backend : str, optional
             Backend to perform the contraction with, e.g. ``'numpy'``,
             ``'cupy'`` or ``'jax'``. Passed to ``opt_einsum``.
@@ -2312,10 +2447,17 @@ class Circuit:
         psi : qarray
             The densely represented wavefunction with ``dtype`` data.
         """
-        psi = self.get_psi_simplified(simplify_sequence, simplify_atol)
+        psi = self.get_psi_simplified(
+            seq=simplify_sequence,
+            atol=simplify_atol,
+            equalize_norms=simplify_equalize_norms
+        )
 
         if dtype is not None:
             psi.astype_(dtype)
+
+        if rehearse == "tn":
+            return psi
 
         output_inds = tuple(map(psi.site_ind, range(self.N)))
         if reverse:
@@ -2349,6 +2491,7 @@ class Circuit:
         return k
 
     to_dense_rehearse = functools.partialmethod(to_dense, rehearse=True)
+    to_dense_tn = functools.partialmethod(to_dense, rehearse="tn")
 
     def simulate_counts(self, C, seed=None, reverse=False, **to_dense_opts):
         """Simulate measuring all qubits in the computational basis many times.
@@ -2387,6 +2530,133 @@ class Circuit:
         ntensor = self._psi.num_tensors
         path = [(0, 1)] + [(0, i) for i in reversed(range(1, ntensor - 1))]
         return self.psi.contract(*args, optimize=path, **contract_opts)
+
+    def xeb(
+        self,
+        samples_or_counts,
+        cache=None,
+        cache_maxsize=2**20,
+        progbar=False,
+        **amplitude_opts,
+    ):
+        """Compute the linear cross entropy benchmark (XEB) for samples or
+        counts, amplitude per amplitude.
+
+        Parameters
+        ----------
+        samples_or_counts : Iterable[str] or Dict[str, int]
+            Either the raw bitstring samples or a dict mapping bitstrings to
+            the number of counts observed.
+        cache : dict, optional
+            A dictionary to store the probabilities in, if not supplied
+            ``quimb.utils.LRU(cache_maxsize)`` will be used.
+        cache_maxsize, optional
+            The maximum size of the cache to be used.
+        progbar, optional
+            Whether to show progress as the bitstrings are iterated over.
+        amplitude_opts
+            Supplied to :meth:`~quimb.tensor.circuit.Circuit.amplitude`.
+        """
+        try:
+            it = samples_or_counts.items()
+        except AttributeError:
+            it = zip(samples_or_counts, itertools.repeat(1))
+
+        if progbar:
+            it = _progbar(it)
+
+        M = 0
+        psum = 0.0
+
+        if cache is None:
+            cache = LRU(cache_maxsize)
+
+        for b, cnt in it:
+            try:
+                p = cache[b]
+            except KeyError:
+                p = cache[b] = abs(self.amplitude(b, **amplitude_opts))**2
+            psum += cnt * p
+            M += cnt
+
+        return (2 ** self.N) / M * psum - 1
+
+    def xeb_ex(
+        self,
+        optimize='auto-hq',
+        simplify_sequence='R',
+        simplify_atol=1e-12,
+        simplify_equalize_norms=False,
+        dtype=None,
+        backend=None,
+        autojit=False,
+        progbar=False,
+        **contract_opts
+    ):
+        """Compute the exactly expected XEB for this circuit. The main feature
+        here is that if you supply a cotengra optimizer that searches for
+        sliced indices then the XEB will be computed without constructing the
+        full wavefunction.
+
+        Parameters
+        ----------
+        optimize : str or PathOptimizer, optional
+            Contraction path optimizer.
+        simplify_sequence : str, optional
+            Simplifications to apply to tensor network prior to contraction.
+        simplify_sequence : str, optional
+            Which local tensor network simplifications to perform and in which
+            order, see
+            :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_atol : float, optional
+            The tolerance with which to compare to zero when applying
+            :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        dtype : str, optional
+            Data type to cast the TN to before contraction.
+        backend : str, optional
+            Convert tensors to, and then use contractions from, this library.
+        autojit : bool, optional
+            Apply ``autoray.autojit`` to the contraciton and map-reduce.
+        progbar : bool, optional
+            Show progress in terms of number of wavefunction chunks processed.
+        """
+        # get potentially simplified TN of full wavefunction
+        psi = self.to_dense_tn(
+            simplify_sequence=simplify_sequence,
+            simplify_atol=simplify_atol,
+            simplify_equalize_norms=simplify_equalize_norms,
+            dtype=dtype,
+        )
+
+        # find a possibly sliced contraction tree
+        output_inds = tuple(map(psi.site_ind, range(self.N)))
+        tree = psi.contraction_tree(optimize=optimize, output_inds=output_inds)
+
+        arrays = psi.arrays
+        if backend is not None:
+            arrays = [do('array', x, like=backend) for x in arrays]
+
+        # perform map-reduce style computation over output wavefunction chunks
+        # so we don't need entire wavefunction in memory at same time
+        chunks = tree.gen_output_chunks(
+            arrays,
+            autojit=autojit,
+            **contract_opts
+        )
+        if progbar:
+            chunks = _progbar(chunks, total=tree.nchunks)
+
+        def f(chunk):
+            return do('sum', do('abs', chunk)**4)
+
+        if autojit:
+            # since we convert the arrays above, the jit backend is
+            # automatically inferred
+            from autoray import autojit
+            f = autojit(f)
+
+        p2sum = functools.reduce(operator.add, map(f, chunks))
+        return 2**self.N * p2sum - 1
 
     def update_params_from(self, tn):
         """Assuming ``tn`` is a tensor network with tensors tagged ``GATE_{i}``

@@ -2158,6 +2158,7 @@ class MatrixProductState(TensorNetwork1DVector,
         p_bra = self.copy()
         p_bra.reindex_sites_(upper_ind_id, where=keep)
         rho = self.H & p_bra
+
         # now have e.g:
         #     | |     |   |
         # o-o-o-o-o-o-o-o-o
@@ -2168,7 +2169,7 @@ class MatrixProductState(TensorNetwork1DVector,
         if isinstance(keep, slice):
             keep = self.slice2sites(keep)
 
-        keep = sorted(keep)
+        #keep = sorted(keep)
 
         for i in self.gen_site_coos():
             if i in keep:
@@ -2177,6 +2178,8 @@ class MatrixProductState(TensorNetwork1DVector,
                 # ... -o- ... -> ... -O- ...
                 #     i|             i|
                 rho ^= self.site_tag(i)
+                if isinstance(rho, Tensor):
+                    rho = TensorNetwork([rho])
             else:
                 #        |
                 #     -o-o-              |
@@ -2860,6 +2863,7 @@ class MatrixProductOperator(TensorNetwork1DOperator,
         arrays = tuple(arrays)
 
         self._L = len(arrays)
+        print(self._L)
 
         # process site indices
         self._upper_ind_id = upper_ind_id
@@ -3052,6 +3056,18 @@ class MatrixProductOperator(TensorNetwork1DOperator,
                             f"MatrixProductState, got {type(other)}")
 
     dot = apply
+
+    def partial_trace(self, coos):
+        """Trace over ``left_inds`` joined with ``right_inds``
+        """
+        left_inds = map(self.upper_ind, coos)
+        right_inds = map(self.lower_ind, coos)
+        site_tags = oset(self.site_tag(i) for i in coos)
+        tn = self.reindex({u: l for u, l in zip(left_inds, right_inds)})
+        tn = tn.contract_tags(site_tags)
+        if isinstance(tn, TensorNetwork):
+            tn.drop_tags(site_tags)
+        return tn
 
     def trace(self, left_inds=None, right_inds=None):
         """Take the trace of this MPO.

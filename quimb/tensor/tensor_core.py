@@ -766,6 +766,7 @@ def tensor_split(
     if right_inds is None:
         right_inds = oset(T.inds) - oset(left_inds)
 
+
     if isinstance(T, spla.LinearOperator):
         left_dims = T.ldims
         right_dims = T.rdims
@@ -6757,7 +6758,6 @@ class TensorNetwork(object):
 
         seen = collections.defaultdict(list)
         for ix, tids in tn.ind_map.items():
-
             # only want to fuse inner bonds
             if len(tids) > 1:
                 seen[frozenset(tids)].append(ix)

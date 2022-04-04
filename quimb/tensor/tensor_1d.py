@@ -22,7 +22,7 @@ from .tensor_core import (
     bonds_size,
     oset,
     tags_to_oset,
-    get_tags,
+get_tags,
     PTensor,
 )
 from ..linalg.base_linalg import norm_trace_dense
@@ -2134,6 +2134,34 @@ class MatrixProductState(TensorNetwork1DVector,
             return S[0]
 
         return S[0] - S[1]
+
+    def combine_sites(self, start, end, inplace = True):
+        # Combines N sites into one
+
+        if inplace is False:
+            mps = self.copy()
+        else:
+            mps = self
+ 
+        sites = list(range((self.L)))
+
+        for i in range(start, end):
+            mps >>= [self.site_tag(i), self.site_tag(i+1)]
+            mps.drop_tags(self.site_tag(i))
+            mps[self.site_tag(i+1)].fuse({self.site_ind(i+1) : [self.site_ind(i), self.site_ind(i+1)]}, inplace=True)
+            sites.remove(i)
+            
+        retag, reind = {}, {}
+        for new, old in enumerate(sites):
+            retag[self.site_tag(old)] = self.site_tag(new)
+            reind[self.site_ind(old)] = self.site_ind(new)
+
+        mps.retag_(retag)
+        mps.reindex_(reind)
+
+        mps = self.from_TN(mps, L = len(sites))
+
+        return mps
 
     def partial_trace(self, keep, upper_ind_id="b{}", rescale_sites=True):
         r"""Partially trace this matrix product state, producing a matrix

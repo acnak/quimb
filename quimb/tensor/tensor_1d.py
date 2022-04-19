@@ -2942,6 +2942,33 @@ class MatrixProductOperator(TensorNetwork1DOperator,
 
         super().__init__(gen_tensors(), virtual=True, **tn_opts)
 
+    def from_dense(psi, dims, upper_ind_id='k{}', lower_ind_id='b{}', site_tag_id='I{}'):
+        L = len(dims)
+        upper_inds = [upper_ind_id.format(i) for i in range(0,int(L/2))]
+        lower_inds = [lower_ind_id.format(i) for i in range(0,int(L/2))]
+        inds = upper_inds + lower_inds
+
+        T = Tensor(reshape(psi.A, dims), inds=inds)
+        def gen_tensors():
+            #           split
+            #       <--  : yield
+            #            : :
+            #     OOOOOOO--O-O-O
+            #     |||||||  | | |
+            #     .......
+            #    left_inds
+            TM = T
+            for i in range(int(L/2) - 1, 0, -1):
+                TM, TR = TM.split(left_inds = upper_inds[:i] + lower_inds[:i], get='tensors',
+                                  rtags=site_tag_id.format(i))
+                yield TR
+
+            TM.add_tag(site_tag_id.format(0))
+            yield TM
+
+        tn = TensorNetwork(gen_tensors())
+        return MatrixProductOperator.from_TN(tn, site_tag_id=site_tag_id, upper_ind_id=upper_ind_id, lower_ind_id=lower_ind_id, cyclic=False, L=int(L/2))
+
     def add_MPO(self, other, inplace=False, compress=False, **compress_opts):
         """Add another MatrixProductState to this one.
         """

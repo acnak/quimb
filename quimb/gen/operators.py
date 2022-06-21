@@ -613,6 +613,77 @@ def ham_heis(n, j=1.0, b=0.0, cyclic=False,
 
     return ham
 
+def ham_aklt(n, cyclic=False,
+             parallel=False, nthreads=None, ownership=None):
+    """Constructs the nearest neighbour 1d heisenberg spin-1/2 hamiltonian.
+
+    Parameters
+    ----------
+    n : int
+        Number of spins.
+    cyclic : bool, optional
+        Whether to couple the first and last spins.
+    sparse : bool, optional
+        Whether to return the hamiltonian in sparse form.
+    stype : str, optional
+        What format of sparse operator to return if ``sparse``.
+    parallel : bool, optional
+        Whether to build the operator in parallel. By default will do this
+        for n > 16.
+    nthreads : int optional
+        How mny threads to use in parallel to build the operator.
+    ownership : (int, int), optional
+        If given, which range of rows to generate.
+    kwargs
+        Supplied to :func:`~quimb.core.quimbify`.
+
+    Returns
+    -------
+    H : immutable operator
+        The Hamiltonian.
+    """
+    dims = (3,) * n
+
+    parallel = (n > 16) if parallel is None else parallel
+
+    op_kws = {'sparse': False, 'stype': 'coo', 'S': 1}
+    ikron_kws = {'sparse': False, 'stype': 'coo',
+                 'coo_build': True, 'ownership': ownership}
+
+    print(spin_operator('+', S=1))
+    print(spin_operator('-', S=1))
+    print(spin_operator('z', S=1))
+    print(np.kron(spin_operator('-', S=1), spin_operator('+', S=1)))
+    # The basic operator (interaction and single b-field) that can be repeated.
+    two_site_term = 0.5*(kron(spin_operator('-', S=1), spin_operator('+', S=1)) + kron(spin_operator('+', S=1), spin_operator('-', S=1))) + kron(-spin_operator('z', S=1), -spin_operator('z', S=1))
+
+    print(two_site_term)
+    two_site_term += 1/3*np.tensordot(two_site_term, two_site_term) 
+    #two_site_term += 1/3*kron(spin_operator('I', **op_kws), spin_operator('I', **op_kws))
+
+    def gen_term(i):
+        # special case: the interaction between first and last spins if cyclic
+        if i == n - 1:
+            stuff = sum(1/2*kron(spin_operator(s, **op_kws), spin_operator(s, **op_kws))
+                    for s in 'xyz') 
+
+            return sum(
+                ikron(stuff,
+                          dims, [0, n - 1], **ikron_kws)
+                for s in 'xyz')
+
+        # General term, on-site b-field plus interaction with next site
+        return ikron(two_site_term, dims, [i, i + 1], **ikron_kws)
+
+    terms_needed = range(0, n if cyclic else n - 1)
+
+    if parallel:
+        pool = get_thread_pool(nthreads)
+        ham = par_reduce(operator.add, pool.map(gen_term, terms_needed))
+    else:
+        ham = sum(map(gen_term, terms_needed))
+
+    return ham
 
 def ham_ising(n, jz=1.0, bx=1.0, **ham_opts):
     """Generate the quantum transverse field ising model hamiltonian. This is a

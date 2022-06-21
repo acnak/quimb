@@ -1456,10 +1456,11 @@ class TensorNetwork1DFlat(TensorNetwork1D,
         if not (0 < i < self.L):
             raise ValueError(f"Need 0 < i < {self.L}, got i={i}.")
 
-        self.canonize(i, cur_orthog)
+        psi = self.copy()
+        psi.canonize(i, cur_orthog)
 
-        Tm1 = self[i]
-        left_inds = Tm1.bonds(self[i - 1])
+        Tm1 = psi[i]
+        left_inds = Tm1.bonds(psi[i - 1])
         return Tm1.singular_values(left_inds, method=method)
 
     def expand_bond_dimension(self, new_bond_dim, inplace=True, bra=None,

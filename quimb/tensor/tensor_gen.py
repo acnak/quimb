@@ -1611,6 +1611,38 @@ def MPS_ghz_state(L, dtype='float64', **mps_opts):
 
     return MatrixProductState(gen_arrays(), **mps_opts)
 
+def MPS_aklt_state(L, dtype='float64', cyclic=True, **mps_opts):
+    """Build the D=2 MPS representation of the spin-one AKLT state.
+
+    Parameters
+    ----------
+    L : int
+        Number of qutrits.
+    dtype : {'float64', 'complex128', 'float32', 'complex64'}, optional
+        The underlying data type.
+    mps_opts
+        Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductState`.
+    """
+
+    def gen_arrays():
+        if cyclic is False:
+            yield np.array([[0, 1, 0],
+                            [1, 0, 0]]).astype(dtype)
+
+        for i in range(L) if cyclic is True else range(1,L-1):
+            yield np.array([[[0, np.sqrt(2/3)],
+                             [-1/np.sqrt(3), 0],
+                             [0,0]],
+                            [[0,0],
+                             [0,1/np.sqrt(3)],
+                             [-np.sqrt(2/3),0]]]).astype(dtype)
+
+        if cyclic is False:
+            yield np.array([[0, 0], 
+                            [-1/np.sqrt(3), 0],
+                            [0, -np.sqrt(2/3)]]).astype(dtype)
+
+    return MatrixProductState(gen_arrays(), shape='lpr', **mps_opts)
 
 def MPS_w_state(L, dtype='float64', **mps_opts):
     """Build the chi=2 OBC MPS representation of the W state.

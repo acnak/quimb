@@ -1594,6 +1594,7 @@ class Circuit:
         dtype='complex128',
         target_size=None,
         rehearse=False,
+        inplace=False,
     ):
         r"""Compute the a single expectation value of operator ``G``, acting on
         sites ``where``, making use of reverse lightcone cancellation.
@@ -1644,11 +1645,18 @@ class Circuit:
             Returns a dict with keys ``'tn'`` and ``'info'`` with the tensor
             network that will be contracted and the corresponding contraction
             path if so.
+        inplace : bool, optional
+            If ``True`` don't generate a copy of the circuit before measuring expectation
 
         Returns
         -------
         scalar, tuple[scalar] or dict
         """
+
+        if inplace is False:
+            psi = self.psi.copy()
+            self = self.__class__(psi0=psi)
+
         if isinstance(where, numbers.Integral):
             where = (where,)
 

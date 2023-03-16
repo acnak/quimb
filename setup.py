@@ -1,5 +1,4 @@
 from setuptools import setup, find_packages
-import versioneer
 
 
 def readme():
@@ -15,9 +14,8 @@ setup(
     name='quimb',
     description='Quantum information and many-body library.',
     long_description=readme(),
+    long_description_content_type='text/x-rst',
     url='http://quimb.readthedocs.io',
-    version=versioneer.get_version(),
-    cmdclass=versioneer.get_cmdclass(),
     author='Johnnie Gray',
     author_email="johnniemcgray@gmail.com",
     license='Apache',
@@ -35,7 +33,7 @@ setup(
             'matplotlib>=2.0',
             'networkx>=2.3',
             'opt_einsum>=3.2',
-            'autoray>=0.2.0',
+            'autoray>=0.5.1',
             'diskcache>=3.0',
         ],
         'advanced_solvers': [
@@ -53,22 +51,27 @@ setup(
         ],
         'docs': [
             'sphinx>=2.0',
-            'sphinx-book-theme>=0.1',
-            'nbsphinx>=0.4',
-            'ipython>=7.0',
+            'sphinx-autoapi',
+            'sphinx-copybutton',
+            'sphinx-design',
+            'myst-nb',
+            'furo',
+            'setuptools_scm',
+            'ipython!=8.7.0',
             'autoray>=0.2.0',
             'opt_einsum>=3.2',
+            'doc2dash>=2.4.1',
         ],
     },
     scripts=['bin/quimb-mpi-python'],
-    python_requires='>=3.6',
+    python_requires='>=3.8',
     classifiers=[
         'Development Status :: 3 - Alpha',
         'License :: OSI Approved :: Apache Software License',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
     ],
     keywords='quantum physics tensor networks tensors dmrg tebd',
 )

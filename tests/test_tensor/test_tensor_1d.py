@@ -5,10 +5,10 @@ from numpy.testing import assert_allclose
 
 import quimb as qu
 from quimb.tensor import (
-    MatrixProductState, MatrixProductOperator, align_TN_1D, MPS_rand_state,
-    MPO_identity, MPO_identity_like, MPO_zeros, MPO_zeros_like, MPO_rand,
-    MPO_rand_herm, MPO_ham_heis, MPS_neel_state, MPS_zero_state, bonds,
-    MPS_computational_state, Dense1D)
+    MatrixProductState, MatrixProductOperator, tensor_network_align,
+    MPS_rand_state, MPO_identity, MPO_identity_like, MPO_zeros, MPO_zeros_like,
+    MPO_rand, MPO_rand_herm, MPO_ham_heis, MPS_neel_state, MPS_zero_state,
+    bonds, MPS_computational_state, Dense1D)
 from quimb.tensor.tensor_core import oset
 
 
@@ -58,11 +58,24 @@ class TestMatrixProductState:
         assert_allclose(z3, z7)
 
     def test_from_dense(self):
-        psi = qu.rand_ket(2**8)
-        mps = MatrixProductState.from_dense(psi, dims=[2] * 8)
-        assert mps.tags == oset(f'I{i}' for i in range(8))
-        assert mps.site_inds == tuple(f'k{i}' for i in range(8))
-        assert mps.L == 8
+        L = 8
+        psi = qu.rand_ket(2**L)
+        mps = MatrixProductState.from_dense(psi, dims=[2] * L)
+        assert mps.tags == oset(f'I{i}' for i in range(L))
+        assert mps.site_inds == tuple(f'k{i}' for i in range(L))
+        assert mps.L == L
+        assert mps.bond_sizes() == [2, 4, 8, 16, 8, 4, 2]
+        mpod = mps.to_dense()
+        assert qu.expec(mpod, psi) == pytest.approx(1)
+
+    def test_from_dense_low_rank(self):
+        L = 6
+        psi = qu.ghz_state(L)
+        mps = MatrixProductState.from_dense(psi, dims=[2] * L)
+        assert mps.tags == oset(f'I{i}' for i in range(L))
+        assert mps.site_inds == tuple(f'k{i}' for i in range(L))
+        assert mps.L == L
+        assert mps.bond_sizes() == [2, 2, 2, 2, 2]
         mpod = mps.to_dense()
         assert qu.expec(mpod, psi) == pytest.approx(1)
 
@@ -304,7 +317,7 @@ class TestMatrixProductState:
 
         p2 = p.add_MPS(p, compress=True, method=method, form=form, cutoff=1e-6)
         assert max(p2['I4'].shape) == 7
-        assert_allclose(p2.H @ p, 2)
+        assert_allclose(p2.H @ p, 2, rtol=1e-5)
 
     def test_subtract(self):
         a, b, c = (MPS_rand_state(10, 7) for _ in 'abc')
@@ -320,6 +333,13 @@ class TestMatrixProductState:
         b -= c
         abmc = a.H @ b
         assert_allclose(ab - ac, abmc)
+
+    def test_amplitude(self):
+        mps = MPS_rand_state(10, 7)
+        k = mps.to_dense()
+        idx = np.random.randint(0, k.shape[0])
+        c_b = mps.amplitude(f'{idx:0>10b}')
+        assert k[idx, 0] == pytest.approx(c_b)
 
     def test_schmidt_values_entropy_gap_simple(self):
         n = 12
@@ -358,18 +378,22 @@ class TestMatrixProductState:
         else:
             if rescale:
                 if keep == [1]:
-                    assert r.lower_inds == ('u0',)
-                    assert r.upper_inds == ('k0',)
+                    assert r.lower_inds_present == ('u0',)
+                    assert r.upper_inds_present == ('k0',)
                 else:
-                    assert r.lower_inds == ('u0', 'u1', 'u2', 'u3', 'u4')
-                    assert r.upper_inds == ('k0', 'k1', 'k2', 'k3', 'k4')
+                    assert r.lower_inds_present == ('u0', 'u1', 'u2',
+                                                   'u3', 'u4')
+                    assert r.upper_inds_present == ('k0', 'k1', 'k2',
+                                                   'k3', 'k4')
             else:
                 if keep == [1]:
-                    assert r.lower_inds == ('u1',)
-                    assert r.upper_inds == ('k1',)
+                    assert r.lower_inds_present == ('u1',)
+                    assert r.upper_inds_present == ('k1',)
                 else:
-                    assert r.lower_inds == ('u2', 'u3', 'u4', 'u6', 'u8')
-                    assert r.upper_inds == ('k2', 'k3', 'k4', 'k6', 'k8')
+                    assert r.lower_inds_present == ('u2', 'u3', 'u4',
+                                                    'u6', 'u8')
+                    assert r.upper_inds_present == ('k2', 'k3', 'k4',
+                                                    'k6', 'k8')
         assert_allclose(r.trace(), 1.0)
         assert qu.isherm(rd)
         pd = p.to_dense()
@@ -528,6 +552,16 @@ class TestMatrixProductState:
         p.gate_(G, (1, n - 2), contract='swap+split')
         assert p.bond_sizes() == [1] + [2] * (n - 3) + [1]
 
+    def test_flip(self):
+        p = MPS_rand_state(5, 3)
+        pf = p.flip()
+        # we want a single index per dimension, not all combined into one
+        inds = [[ix] for ix in p.site_inds]
+        assert_allclose(
+            p.to_dense(*inds),
+            pf.to_dense(*inds).transpose()
+        )
+
     def test_correlation(self):
         ghz = (MPS_computational_state('0000') +
                MPS_computational_state('1111')) / 2**0.5
@@ -561,6 +595,19 @@ class TestMatrixProductState:
         psid = psi2.to_dense()
         Gd = qu.ikron(G, [2] * 10, (7, 8))
         assert psi.to_dense().H @ (Gd @ psid) == pytest.approx(1.0)
+
+    def test_swap_far_sites(self):
+        psi = MPS_rand_state(7, 2)
+        for i, j in [(0, 6), (6, 1), (5, 2)]:
+            k1 = psi.to_dense([
+                psi.site_ind(
+                    j if site == i else
+                    i if site == j else
+                    site
+                ) for site in psi.sites
+            ])
+            k2 = psi.swap_sites_with_compress(i, j).to_dense()
+            assert qu.fidelity(k1, k2) == pytest.approx(1.0)
 
     def test_swap_gating(self):
         psi0 = MPS_rand_state(20, 5)
@@ -619,6 +666,17 @@ class TestMatrixProductState:
     def test_measure_known_outcome(self):
         mps = MPS_computational_state('010101')
         assert mps.measure_(3, get='outcome') == 1
+
+    def test_permute_arrays(self):
+        mps = MPS_rand_state(7, 5)
+        k0 = mps.to_dense()
+        mps.canonize(3)
+        mps.permute_arrays('prl')
+        assert mps[0].shape == (2, 2)
+        assert mps[1].shape == (2, 4, 2)
+        assert mps[2].shape == (2, 5, 4)
+        kf = mps.to_dense()
+        assert qu.fidelity(k0, kf) == pytest.approx(1.0)
 
 
 class TestMatrixProductOperator:
@@ -714,7 +772,7 @@ class TestMatrixProductOperator:
         b = MPS_rand_state(13, 7)
         o1 = k @ b
         i = MPO_identity(13)
-        k, i, b = align_TN_1D(k, i, b)
+        k, i, b = tensor_network_align(k, i, b)
         o2 = (k & i & b) ^ ...
         assert_allclose(o1, o2)
 
@@ -791,6 +849,14 @@ class TestMatrixProductOperator:
         Ad, xd, yd = A.to_dense(), x.to_dense(), y.to_dense()
         assert_allclose(Ad @ xd, yd)
 
+    def test_permute_arrays(self):
+        mpo = MPO_rand(4, 3)
+        A0 = mpo.to_dense()
+        mpo.permute_arrays('drul')
+        assert mpo[0].shape == (2, 3, 2)
+        assert mpo[1].shape == (2, 3, 2, 3)
+        Af = mpo.to_dense()
+        assert_allclose(A0, Af)
 
 # --------------------------------------------------------------------------- #
 #                         Test specific 1D instances                          #

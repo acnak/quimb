@@ -1,6 +1,6 @@
-############
+============
 Installation
-############
+============
 
 :mod:`quimb` itself is a pure python package and can now be found on PyPI:
 
@@ -13,7 +13,7 @@ The code is hosted on `github <https://github.com/jcmgray/quimb>`_ and if the de
 
 .. code-block:: bash
 
-    pip install --no-deps -U git+git://github.com/jcmgray/quimb.git@develop
+    pip install --no-deps -U git+https://github.com/jcmgray/quimb.git@develop
 
 
 Required Dependencies
@@ -37,7 +37,7 @@ In addition, the tensor network library, :mod:`quimb.tensor`, requires:
 * `autoray <https://github.com/jcmgray/autoray>`_
 
 ``opt_einsum`` efficiently optimizes tensor contraction expressions. It can be installed with ``pip`` or from `conda-forge <https://conda-forge.org>`_ and is a required dependency since various bits of the core ``quimb`` module now make use tensor-network functionality behind the scenes.
-``autoray`` allows backend agnostic numeric code for various tensor network operations so that many libraries other than ``numpy`` can be used. It can be installed via ``pip`` from `pypi <https://pypi.org/project/autoray/>`_ or via ``conda`` from `conda-forge <https://anaconda.org/conda-forge/autoray>`_.
+``autoray`` allows backend agnostic numeric code for various tensor network operations so that many libraries other than ``numpy`` can be used. It can be installed via ``pip`` from `pypi <https://pypi.org/project/autoray/>`_ or via ``conda`` `from conda-forge <https://anaconda.org/conda-forge/autoray>`_.
 
 
 Optional Dependencies

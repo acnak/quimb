@@ -1,3 +1,6 @@
+"""Tools for performing TEBD like algorithms on arbitrary lattices.
+"""
+
 import random
 import itertools
 import collections
@@ -6,7 +9,7 @@ from autoray import do, to_numpy, dag
 
 from ..core import eye, kron, qarray
 from ..utils import ensure_dict
-from ..utils import progbar as Progbar
+from ..utils import progbar as Progbar, default_to_neutral_style
 from .tensor_core import Tensor
 from .drawing import get_colors, get_positions
 
@@ -215,9 +218,7 @@ class LocalHamGen:
         """
         import networkx as nx
 
-        G = nx.Graph()
-        for site_a, site_b in self.terms:
-            G.add_edge(site_a, site_b)
+        G = nx.Graph(tuple(self.terms))
 
         coloring = list(
             nx.coloring.greedy_color(
@@ -228,7 +229,11 @@ class LocalHamGen:
         # sort into color groups
         coloring.sort(key=lambda coo_color: coo_color[1])
 
-        return [coo for coo, _ in coloring]
+        return [
+            # networkx doesn't preserve node order of edge spec
+            tuple(sorted(coo)) for
+            coo, _ in coloring
+        ]
 
     def get_auto_ordering(self, order="sort", **kwargs):
         """Get an ordering of the terms to use with TEBD, for example. The
@@ -294,6 +299,7 @@ class LocalHamGen:
         s = "<LocalHamGen(nsites={}, num_terms={})>"
         return s.format(self.nsites, len(self.terms))
 
+    @default_to_neutral_style
     def draw(
         self,
         ordering="sort",
@@ -311,7 +317,7 @@ class LocalHamGen:
         ----------
         ordering : {'sort', None, 'random'}, optional
             An ordering of the termns, or an argument to be supplied to
-            :meth:`quimb.tensor.tensor_gen_tebd.LocalHamGen.get_auto_ordering`
+            :meth:`quimb.tensor.tensor_arbgeom_tebd.LocalHamGen.get_auto_ordering`
             to generate this automatically.
         show_norm : bool, optional
             Show the norm of each term as edge labels.
@@ -445,6 +451,7 @@ class TEBDGen:
         imag=True,
         gate_opts=None,
         ordering=None,
+        second_order_reflect=False,
         compute_energy_every=None,
         compute_energy_final=True,
         compute_energy_opts=None,
@@ -465,6 +472,7 @@ class TEBDGen:
 
         # default time step to use
         self.tau = tau
+        self.last_tau = 0.0
 
         # parse gate application options
         if D is None:
@@ -495,6 +503,8 @@ class TEBDGen:
         else:
             self.ordering = tuple(ordering)
 
+        self.second_order_reflect = second_order_reflect
+
         # storage
         self._n = 0
         self.its = []
@@ -517,17 +527,28 @@ class TEBDGen:
         else:
             ordering = self.ordering
 
-        for where in ordering:
+        if self.second_order_reflect:
+            ordering = tuple(ordering) + tuple(reversed(ordering))
+            factor = 2.0
+        else:
+            factor = 1.0
 
+        for where in ordering:
             if callable(tau):
-                U = self.ham.get_gate_expm(where, -tau(where))
+                self.last_tau = tau(where)
             else:
-                U = self.ham.get_gate_expm(where, -tau)
+                self.last_tau = tau
+
+            U = self.ham.get_gate_expm(where, -self.last_tau / factor)
 
             self.gate(U, where)
 
     def _update_progbar(self, pbar):
-        desc = f"n={self._n}, tau={self.tau}, energy~{float(self.energy):.6f}"
+        desc = (
+            f"n={self._n}, "
+            f"tau={float(self.last_tau):.4f}, "
+            f"energy~{float(self.energy):.6f}"
+        )
         pbar.set_description(desc)
 
     def evolve(self, steps, tau=None, progbar=None):
@@ -619,7 +640,7 @@ class TEBDGen:
             en = en / self.ham.nsites
 
         self.energies.append(float(en))
-        self.taus.append(float(self.tau))
+        self.taus.append(float(self.last_tau))
         self.its.append(self._n)
 
         if self.keep_best and en < self.best['energy']:
@@ -665,7 +686,7 @@ class TEBDGen:
         """Compute and return the energy of the current state. Subclasses can
         override this with a custom method to compute the energy.
         """
-        return self._psi.compute_local_expectation_simple(
+        return self._psi.compute_local_expectation_cluster(
             terms=self.ham.terms,
             **self.compute_energy_opts
         )
@@ -677,6 +698,8 @@ class TEBDGen:
 
 
 class SimpleUpdateGen(TEBDGen):
+    """Simple update for arbitrary geometry hamiltonians.
+    """
 
     def gate(self, U, where):
         self._psi.gate_simple_(
@@ -684,7 +707,7 @@ class SimpleUpdateGen(TEBDGen):
         )
 
     def compute_energy(self):
-        return self._psi.compute_local_expectation_simple(
+        return self._psi.compute_local_expectation_cluster(
             terms=self.ham.terms,
             gauges=self.gauges,
             **self.compute_energy_opts,
@@ -701,7 +724,12 @@ class SimpleUpdateGen(TEBDGen):
 
         return psi
 
-    def set_state(self, psi):
+    def set_state(self, psi, gauges=None):
         self._psi = psi.copy()
-        self.gauges = {}
-        self._psi.gauge_all_simple_(gauges=self.gauges)
+        if gauges is None:
+            self.gauges = {}
+            self._psi.gauge_all_simple_(gauges=self.gauges)
+        else:
+            self.gauges = dict(gauges)
+
+

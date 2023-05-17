@@ -161,6 +161,47 @@ def _trim_and_renorm_svd_result(
 
     return U, None, VH
 
+@compose
+def gesvd_truncated(
+    x,
+    cutoff=-1.0,
+    cutoff_mode=3,
+    max_bond=-1,
+    absorb=0,
+    renorm=0,
+    backend=None,
+):
+    """Truncated svd or raw array ``x``.
+
+    Parameters
+    ----------
+    cutoff : float
+        Singular value cutoff threshold, if ``cutoff <= 0.0``, then only
+        ``max_bond`` is used.
+    cutoff_mode : {1, 2, 3, 4, 5, 6}
+        How to perform the trim:
+
+            - 1: ['abs'], trim values below ``cutoff``
+            - 2: ['rel'], trim values below ``s[0] * cutoff``
+            - 3: ['sum2'], trim s.t. ``sum(s_trim**2) < cutoff``.
+            - 4: ['rsum2'], trim s.t. ``sum(s_trim**2) < sum(s**2) * cutoff``.
+            - 5: ['sum1'], trim s.t. ``sum(s_trim**1) < cutoff``.
+            - 6: ['rsum1'], trim s.t. ``sum(s_trim**1) < sum(s**1) * cutoff``.
+
+    max_bond : int
+        An explicit maximum bond dimension, use -1 for none.
+    absorb : {-1, 0, 1, None}
+        How to absorb the singular values. -1: left, 0: both, 1: right and
+        None: don't absorb (return).
+    renorm : {0, 1}
+        Whether to renormalize the singular values (depends on `cutoff_mode`).
+    """
+    with backend_like(backend):
+        U, s, VH = do("linalg.svd", x, lapack_driver='gesvd', like='scipy')
+        return _trim_and_renorm_svd_result(
+            U, s, VH, cutoff, cutoff_mode, max_bond, absorb, renorm
+        )
+
 
 @compose
 def svd_truncated(
@@ -198,12 +239,7 @@ def svd_truncated(
         Whether to renormalize the singular values (depends on `cutoff_mode`).
     """
     with backend_like(backend):
-        try:
-            U, s, VH = do("linalg.svd", x)
-        except:
-            # Try use the gesvd lapack backend
-            U, s, VH = do("linalg.svd", x, lapack_backend='gesvd', like='scipy')
-
+        U, s, VH = do("linalg.svd", x)
         return _trim_and_renorm_svd_result(
             U, s, VH, cutoff, cutoff_mode, max_bond, absorb, renorm
         )

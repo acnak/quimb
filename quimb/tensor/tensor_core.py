@@ -291,6 +291,7 @@ def rand_uuid(base=""):
 _VALID_SPLIT_GET = {None, 'arrays', 'tensors', 'values'}
 _SPLIT_FNS = {
     'svd': decomp.svd_truncated,
+    'gesvd': decomp.gesvd_truncated,
     'eig': decomp.svd_via_eig_truncated,
     'lu': decomp.lu_truncated,
     'qr': decomp.qr_stabilized,
@@ -511,7 +512,14 @@ def tensor_split(
         method, cutoff, absorb, max_bond, cutoff_mode, renorm)
 
     # ``s`` itself will be None unless ``absorb=None`` is specified
-    left, s, right = _SPLIT_FNS[method](array, **opts)
+    try:
+        left, s, right = _SPLIT_FNS[method](array, **opts)
+    except:
+        if method == 'svd':
+            left, s, right = _SPLIT_FNS['gesvd'](array, **opts)
+        else:
+            raise
+
     if len(left_dims) != 1:
         left = do("reshape", left, (*left_dims, -1))
     if len(right_dims) != 1:

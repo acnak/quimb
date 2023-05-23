@@ -535,7 +535,7 @@ class TensorNetworkGenVector(TensorNetworkGen):
     def to_dense(
         self,
         *inds_seq,
-        to_qarray=True,
+        to_qarray=False,
         to_ket=None,
         **contract_opts
     ):
@@ -579,6 +579,8 @@ class TensorNetworkGenVector(TensorNetworkGen):
             x = do("reshape", x, (-1, 1))
 
         return x
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     def gate(
         self, G, where,
@@ -1500,7 +1502,7 @@ class TensorNetworkGenOperator(TensorNetworkGen):
     def to_dense(
         self,
         *inds_seq,
-        to_qarray=True,
+        to_qarray=False,
         **contract_opts
     ):
         """Contract this tensor network 'operator' into a dense array.
@@ -1530,6 +1532,8 @@ class TensorNetworkGenOperator(TensorNetworkGen):
             to_qarray=to_qarray,
             **contract_opts
         )
+
+    to_qarray = functools.partialmethod(to_dense, to_qarray=True)
 
     def phys_dim(self, site=None, which='upper'):
         """Get the physical dimension of ``site``.

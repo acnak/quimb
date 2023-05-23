@@ -253,15 +253,15 @@ choice = random_seed_fn(_choice)
 
 
 @random_seed_fn
-def rand_rademacher(shape, scale=1, dtype=float):
+def rand_rademacher(shape, scale=1, loc=0.0, dtype=float):
     """
     """
     if np.issubdtype(dtype, np.floating):
-        entries = np.array([1.0, -1.0]) * scale
+        entries = loc + np.array([1.0, -1.0]) * scale
         need2convert = dtype not in (float, np.float_)
 
     elif np.issubdtype(dtype, np.complexfloating):
-        entries = np.array([1.0, -1.0, 1.0j, -1.0j]) * scale
+        entries = loc + np.array([1.0, -1.0, 1.0j, -1.0j]) * scale
         need2convert = dtype not in (complex, np.complex_)
 
     else:
@@ -622,4 +622,4 @@ def rand_mera(n, invariant=False, dtype=complex):
     else:
         constructor = qt.MERA.rand
 
-    return constructor(n, dtype=dtype).to_dense()
+    return constructor(n, dtype=dtype).to_qarray()

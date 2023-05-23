@@ -3,9 +3,24 @@ Changelog
 
 Release notes for ``quimb``.
 
-.. _whats-new.1.4.3:
+.. _whats-new.1.5.1:
 
-v1.4.3 (unreleased)
+v1.5.1 (unreleased)
+-------------------
+
+**Enhancements:**
+
+- add :func:`~quimb.tensor.tensor_builder.MPS_COPY`.
+- add 'density matrix' and 'zip-up' MPO-MPS algorithms.
+- add `drop_tags` option to :meth:`~quimb.tensor.tensor_contract`
+
+**Bug fixes:**
+
+- :class:`Circuit`: use stack for more robust parametrized gate generation
+
+.. _whats-new.1.5.0:
+
+v1.5.0 (2023-05-03)
 -------------------
 
 **Enhancements**
@@ -50,6 +65,19 @@ v1.4.3 (unreleased)
 - add ``'lu'``, ``'polar_left'`` and ``'polar_right'`` methods to
   :func:`~quimb.tensor.tensor_core.tensor_split`.
 - add experimental arbitrary hamilotonian MPO building
+- :class:`~quimb.tensor.tensor_core.TensorNetwork`: allow empty constructor
+  (i.e. no tensors representing simply the scalar 1)
+- :meth:`~quimb.tensor.tensor_core.TensorNetwork.drop_tags`: allow all tags to
+  be dropped
+- tweaks to compressed contraction and gauging
+- add jax, flax and optax example
+- add 3D and interactive plotting of tensors networks with via plotly.
+- add pygraphiviz layout options
+- add :meth:`~quimb.tensor.tensor_core.TensorNetwork.combine` for unified
+  handling of combining
+  tensor networks potentially with structure
+- add HTML colored pretty printing of tensor networks for notebooks
+- add `quimb.experimental.cluster_update.py`
 
 
 **Bug fixes:**

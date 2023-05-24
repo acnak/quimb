@@ -314,7 +314,7 @@ _SPLIT_FNS = {
     'eigsh': decomp.eigsh,
 }
 _SPLIT_VALUES_FNS = {'svd': decomp.svdvals, 'eig': decomp.svdvals_eig}
-_FULL_SPLIT_METHODS = {'svd', 'eig', 'eigh'}
+_FULL_SPLIT_METHODS = {'svd', 'eig', 'eigh', 'gesvd'}
 _RANK_HIDDEN_METHODS = {'qr', 'lq', 'cholesky', 'polar_right', 'polar_left'}
 _DENSE_ONLY_METHODS = {
     'svd', 'eig', 'eigh', 'cholesky', 'qr', 'lq', 'polar_right', 'polar_left',
@@ -461,7 +461,7 @@ def tensor_split(
         a canonical environment, corresponding to maintaining the frobenius
         or nuclear norm. If ``None`` (the default) then this is automatically
         turned on only for ``cutoff_method in {'sum2', 'rsum2', 'sum1',
-        'rsum1'}`` with ``method in {'svd', 'eig', 'eigh'}``.
+        'rsum1'}`` with ``method in {'svd', 'gesvd', 'eig', 'eigh'}``.
     ltags : sequence of str, optional
         Add these new tags to the left tensor.
     rtags : sequence of str, optional

@@ -197,7 +197,7 @@ def gesvd_truncated(
         Whether to renormalize the singular values (depends on `cutoff_mode`).
     """
     with backend_like(backend):
-        U, s, VH = do("linalg.svd", x, lapack_driver='gesvd', like='scipy')
+        U, s, VH = do("linalg.svd", x, lapack_driver='gesvd', like='scipy', full_matrices=False)
         return _trim_and_renorm_svd_result(
             U, s, VH, cutoff, cutoff_mode, max_bond, absorb, renorm
         )

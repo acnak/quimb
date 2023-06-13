@@ -10,6 +10,7 @@ from numbers import Integral
 
 import scipy.sparse.linalg as spla
 from autoray import do, dag, reshape, conj, get_dtype_name, transpose
+from itertools import chain, combinations
 
 from ..utils import (
     print_multi_line, ensure_dict, partition_all, deprecated
@@ -1858,6 +1859,29 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
             raise NotImplementedError
 
         return self.singular_values(i, cur_orthog, method=method)**2
+
+    def concentratable_entropy(self, s):
+        """Determine the concentratable entropy of some set s as per
+        https://arxiv.org/pdf/2104.06923.pdf
+
+        Parameters
+        ----------
+        s : tuple or list
+            The set of sites to determine the concentratable entropy of
+         
+        Returns
+        -------
+        float
+        """
+
+        power_set = list(chain.from_iterable(combinations(s, r) for r in range(len(s)+1)))[1:]
+
+        e = 1 - 1/(2**len(s))
+        for comb in power_set:
+            rho_red = self.partial_trace(comb).to_dense()
+            e -= 1/(2**len(s))*np.trace(rho_red @ rho_red)
+
+        return e
 
     def entropy(self, i, cur_orthog=None, method='svd'):
         """The entropy of bipartition between the left block of ``i`` sites and

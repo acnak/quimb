@@ -2687,7 +2687,6 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         arrays = tuple(arrays)
 
         self._L = len(arrays)
-        print(self._L)
 
         # process site indices
         self._upper_ind_id = upper_ind_id
@@ -2738,7 +2737,7 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
 
         super().__init__(gen_tensors(), virtual=True, **tn_opts)
 
-    def from_dense(psi, dims, upper_ind_id='k{}', lower_ind_id='b{}', site_tag_id='I{}'):
+    def from_dense(psi, dims, upper_ind_id='k{}', lower_ind_id='b{}', site_tag_id='I{}', **split_opts):
         L = len(dims)
         upper_inds = [upper_ind_id.format(i) for i in range(0,int(L/2))]
         lower_inds = [lower_ind_id.format(i) for i in range(0,int(L/2))]
@@ -2756,7 +2755,7 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
             TM = T
             for i in range(int(L/2) - 1, 0, -1):
                 TM, TR = TM.split(left_inds = upper_inds[:i] + lower_inds[:i], get='tensors',
-                                  rtags=site_tag_id.format(i))
+                                  rtags=site_tag_id.format(i), **split_opts)
                 yield TR
 
             TM.add_tag(site_tag_id.format(0))

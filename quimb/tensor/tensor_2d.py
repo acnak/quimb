@@ -4116,6 +4116,61 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         norm = self.make_norm(layer_tags=layer_tags)
         return norm.contract_boundary(layer_tags=layer_tags, **contract_opts)
 
+    def compute_rdm(
+        self,
+        sites,
+        max_bond=None,
+        *,
+        cutoff=1e-10,
+        canonize=True,
+        mode="mps",
+        layer_tags=("KET", "BRA"),
+        normalized=False,
+        autogroup=True,
+        contract_optimize="auto-hq",
+        return_all=False,
+        plaquette_envs=None,
+        plaquette_map=None,
+        **plaquette_env_options,
+    ):
+        norm, ket, bra = self.make_norm(return_all=True)
+
+        if plaquette_envs is None:
+            plaquette_env_options["max_bond"] = max_bond
+            plaquette_env_options["cutoff"] = cutoff
+            plaquette_env_options["canonize"] = canonize
+            plaquette_env_options["mode"] = mode
+            plaquette_env_options["layer_tags"] = layer_tags
+
+            plaquette_envs = dict()
+            for x_bsz, y_bsz in calc_plaquette_sizes([sites], autogroup):
+                plaquette_envs.update(
+                    norm.compute_plaquette_environments(
+                        x_bsz=x_bsz, y_bsz=y_bsz, **plaquette_env_options
+                    )
+                )
+
+        if plaquette_map is None:
+            # work out which plaquettes to use for which terms
+            plaquette_map = calc_plaquette_map(plaquette_envs, len(sites))
+
+        # now group the terms into just the plaquettes we need
+        plaq2coo = defaultdict(list)
+        p = plaquette_map[tuple(sites)]
+        osites = sites
+        sites = tuple(map(ket.site_tag, plaquette_to_sites(p)))
+
+        # view the ket portion as 2d vector so we can gate it
+        ket_local = ket.select_any(sites)
+        #ket_local.view_as_(TensorNetwork2DVector, like=self)
+        bra_local = bra.select_any(sites) 
+        bra_local = bra_local.reindex_sites('b{},{}', where=osites)
+        bra_and_env = (bra_local | plaquette_envs[p]).contract(all, optimize=contract_optimize)
+        rho = (bra_and_env | ket_local).contract(all)
+
+        #return bra.select_any(sites).to_dense().conj() @ ket_local.to_dense().transpose().conj()
+        return rho.data
+
     def compute_local_expectation(
         self,
         terms,
@@ -5254,7 +5309,7 @@ def plaquette_to_sites(p):
     )
 
 
-def calc_plaquette_map(plaquettes):
+def calc_plaquette_map(plaquettes, pair_size = 2):
     """Generate a dictionary of all the coordinate pairs in ``plaquettes``
     mapped to the 'best' (smallest) rectangular plaquette that contains them.
 
@@ -5295,9 +5350,8 @@ def calc_plaquette_map(plaquettes):
         sites = plaquette_to_sites(p)
         for site in sites:
             mapping[site] = p
-        # this will generate all coordinate pairs with ij_a < ij_b
-        for ij_a, ij_b in combinations(sites, 2):
-            mapping[ij_a, ij_b] = p
+        for a in combinations(sites, pair_size):
+            mapping[a] = p
 
     return mapping
 

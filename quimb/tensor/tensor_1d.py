@@ -1906,7 +1906,7 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
 
         S = self.schmidt_values(i, cur_orthog=cur_orthog, method=method)
         S = S[S > 0.0]
-        return do('sum', -S * do('log2', S))
+        return do('sum', -S * do('log', S))
 
     def schmidt_gap(self, i, cur_orthog=None, method='svd'):
         """The schmidt gap of bipartition between the left block of ``i`` sites

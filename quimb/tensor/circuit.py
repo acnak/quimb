@@ -57,58 +57,188 @@ def _put_registers_last(x):
     return tuple(concatv(*parts[:-2], parts[-1], parts[-2]))
 
 
-def parse_qasm(qasm):
-    """Parse qasm from a string.
-
-    Parameters
-    ----------
-    qasm : str
-        The full string of the qasm file.
-
-    Returns
-    -------
-    circuit_info : dict
-        Information about the circuit:
-
-        - circuit_info['n']: the number of qubits
-        - circuit_info['n_gates']: the number of gates in total
-        - circuit_info['gates']: list[list[str]], list of gates, each of which
-          is a list of strings read from a line of the qasm file.
-    """
-
-    lines = qasm.split('\n')
-    n = int(lines[0])
-
-    # turn into tuples of python types
-    gates = [
-        tuple(map(_convert_ints_and_floats, line.strip().split(" ")))
-        for line in lines[1:] if line
-    ]
-
-    # put registers/parameters in standard order and detect if gate round used
-    gates = tuple(map(_put_registers_last, gates))
-    round_specified = isinstance(gates[0][0], numbers.Integral)
-
+@functools.lru_cache(None)
+def get_openqasm2_regexes():
     return {
-        'n': n,
-        'gates': gates,
-        'n_gates': len(gates),
-        'round_specified': round_specified,
+        "header": re.compile(r"(OPENQASM\s+2.0;)|(include\s+\"qelib1.inc\";)"),
+        "comment": re.compile(r"^//"),
+        "comment_start": re.compile(r"/\*"),
+        "comment_end": re.compile(r"\*/"),
+        "qreg": re.compile(r"qreg\s+(\w+)\s*\[(\d+)\];"),
+        "gate": re.compile(r"(\w+)\s*(\((.+)\))?\s*(.*);"),
+        "error": re.compile(r"^(if|for)"),
+        "ignore": re.compile(r"^(creg|measure|barrier)"),
+        "gate_def": re.compile(r"^gate"),
+        "gate_sig": re.compile(r"^gate\s+(\w+)\s*(\((.+)\))?\s*(.*)"),
     }
 
-
-def parse_qasm_file(fname, **kwargs):
-    """Parse a qasm file.
+def parse_openqasm2_str(contents):
+    """Parse the string contents of an OpenQASM 2.0 file. This parser does not
+    support classical control flow is not guaranteed to check the full openqasm
+    grammar.
     """
-    return parse_qasm(open(fname).read(), **kwargs)
+    # define regular expressions for parsing
+    rgxs = get_openqasm2_regexes()
+
+    # initialise number of qubits to zero and an empty list for gates
+    sitemap = {}
+    gates = []
+    custom_gates = {}
+    # only want to warn once about each ignored instruction
+    warned = {}
+
+    # Process each line
+    in_comment = False
+    lines = contents.split("\n")
+    while lines:
+        line = lines.pop(0).strip()
+        if not line:
+            # blank line
+            continue
+        if rgxs["comment"].match(line):
+            # single comment
+            continue
+        if rgxs["comment_start"].match(line):
+            # start of multiline comments
+            in_comment = True
+        if in_comment:
+            # in multiline comment, check if its ending
+            in_comment = not bool(rgxs["comment_end"].match(line))
+            continue
+        if rgxs["header"].match(line):
+            # ignore standard header lines
+            continue
+
+        match = rgxs["qreg"].match(line)
+        if match:
+            # quantum register -> extend sites
+            name, nq = match.groups()
+            for i in range(int(nq)):
+                sitemap[f"{name}[{i}]"] = len(sitemap)
+            continue
+
+        match = rgxs["ignore"].match(line)
+        if match:
+            # certain operations we can just ignore and warn about
+            (op,) = match.groups()
+            if not warned.get(op, False):
+                warnings.warn(
+                    f"Unsupported operation ignored: {op}", SyntaxWarning
+                )
+                warned[op] = True
+            continue
+
+        if rgxs["error"].match(line):
+            # raise hard error for custom tate defns etc
+            raise NotImplementedError(
+                f"The following instruction is not supported: {line}"
+            )
+
+        if rgxs["gate_def"].match(line):
+            # custom gate definition:
+            # first gather all lines involved in the gate definition
+            gate_lines = [line]
+            while True:
+                if "}" in line:
+                    # finished -> break
+                    break
+                else:
+                    # not finished -> need next line
+                    line = lines.pop(0)
+                    gate_lines.append(line)
+
+            # then combine this full gate definition, without newlines
+            gate_body = "".join(gate_lines)
+            # separate the signature and body
+            gate_sig, gate_body = re.match(
+                r"(.*)\s*{(.*)}", gate_body
+            ).groups()
+
+            # parse the signature
+            match = rgxs["gate_sig"].match(gate_sig)
+            label = match[1]
+            sig_params = to_clean_list(match[3], ",")
+            sig_qubits = to_clean_list(match[4], ",")
+
+            # break body only back into individual lines, include semicolons
+            gate_body = to_clean_list(gate_body, ";")
+            # insert formatters, (using simple `replace` on the whole line will
+            # scramble the label if parameters or qubits are letters etc)
+            for i, gate_line in enumerate(gate_body):
+                gm = rgxs["gate"].match(gate_line + ";")
+                glabel = gm[1]
+                gqubits = multi_replace(
+                    gm[4], {q: f"{{{q}}}" for q in sig_qubits}
+                )
+                if gm[3]:
+                    # sub gate line is parametrized gate
+                    gparams = multi_replace(
+                        gm[3], {p: f"{{{p}}}" for p in sig_params}
+                    )
+                    gate_body[i] = f"{glabel}({gparams}) {gqubits};"
+                else:
+                    # sub gate line is standard gate
+                    gate_body[i] = f"{glabel} {gqubits};"
+
+            custom_gates[label] = sig_params, sig_qubits, gate_body
+            continue
+
+        match = rgxs["gate"].search(line)
+        if match:
+            # apply a gate
+            label, params, qubits = (
+                match.group(1),
+                match.group(3),
+                match.group(4),
+            )
+
+            if label in custom_gates:
+                # custom gate -> resolve parameters and qubits and prepend
+                # the constituent gate lines to the main list
+                sig_params, sig_qubits, gate_body = custom_gates[label]
+                replacer = {
+                    **dict(zip(sig_params, to_clean_list(params, ","))),
+                    **dict(zip(sig_qubits, to_clean_list(qubits, ","))),
+                }
+
+                # recurse by prepending the translated gate body
+                for gl in reversed(gate_body):
+                    lines.insert(0, gl.format(**replacer))
+
+                continue
+
+            # standard gate -> add to list directly
+            if params:
+                params = tuple(
+                    eval(param, {"pi": math.pi}) for param in params.split(",")
+                )
+            else:
+                params = ()
+
+            qubits = tuple(
+                sitemap[qubit.strip()] for qubit in qubits.split(",")
+            )
+            gates.append(Gate(label, params, qubits))
+            continue
+
+        # if not covered by previous checks, simply raise
+        raise SyntaxError(f"{line}")
+
+    return {
+        "n": len(sitemap),
+        "sitemap": sitemap,
+        "gates": gates,
+        "n_gates": len(gates),
+    }
+
+def parse_openqasm2_file(fname, **kwargs):
+    """Parse an OpenQASM 2.0 file."""
+    with open(fname) as f:
+        return parse_openqasm2_str(f.read(), **kwargs)
 
 
-def parse_qasm_url(url, **kwargs):
-    """Parse a qasm url.
-    """
-    from urllib import request
-    return parse_qasm(request.urlopen(url).read().decode(), **kwargs)
-
+def parse_openqasm2_url(url, **kwargs):
+    return parse_openqasm2_str(request.urlopen(url).read().decode(), **kwargs)
 
 # -------------------------- core gate functions ---------------------------- #
 
@@ -184,6 +314,7 @@ register_constant_gate('X', qu.pauli('X'), 1)
 register_constant_gate('Y', qu.pauli('Y'), 1)
 register_constant_gate('Z', qu.pauli('Z'), 1)
 register_constant_gate('S', qu.S_gate(), 1)
+register_constant_gate('SDG', qu.S_gate().H, 1)
 register_constant_gate('T', qu.T_gate(), 1)
 register_constant_gate('X_1_2', qu.Xsqrt(), 1, 'X_1/2')
 register_constant_gate('Y_1_2', qu.Ysqrt(), 1, 'Y_1/2')

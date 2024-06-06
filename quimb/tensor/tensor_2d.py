@@ -4165,8 +4165,8 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         #ket_local.view_as_(TensorNetwork2DVector, like=self)
         bra_local = bra.select_any(sites) 
         bra_local = bra_local.reindex_sites('b{},{}', where=osites)
-        bra_and_env = (bra_local | plaquette_envs[p]).contract(all, optimize=contract_optimize)
-        rho = (bra_and_env | ket_local).contract(all)
+        bra_and_env = (bra_local | plaquette_envs[p])
+        rho = (bra_and_env | ket_local).contract(all, optimize=contract_optimize)
 
         #return bra.select_any(sites).to_dense().conj() @ ket_local.to_dense().transpose().conj()
         return rho.data

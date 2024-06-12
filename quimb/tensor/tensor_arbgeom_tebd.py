@@ -308,7 +308,6 @@ class LocalHamGen:
         fontsize=8,
         legend=True,
         ax=None,
-        return_fig=False,
         **kwargs,
     ):
         """Plot this Hamiltonian as a network.
@@ -329,8 +328,6 @@ class LocalHamGen:
             Whether to show the legend of which terms are in which group.
         ax : None or matplotlib.Axes, optional
             Add to a existing set of axes.
-        return_fig : bool, optional
-            Whether to return any newly created figure.
         """
         import networkx as nx
         import matplotlib.pyplot as plt
@@ -344,6 +341,8 @@ class LocalHamGen:
             fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
             ax.axis("off")
             ax.set_aspect("equal")
+        else:
+            fig = None
 
         if ordering is None or isinstance(ordering, str):
             ordering = self.get_auto_ordering(ordering, **kwargs)
@@ -425,13 +424,7 @@ class LocalHamGen:
                 bbox_to_anchor=(1, 0.5),
             )
 
-        if ax_supplied:
-            return
-
-        if return_fig:
-            return fig
-
-        plt.show()
+        return fig, ax
 
     graph = draw
 

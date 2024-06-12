@@ -1008,7 +1008,8 @@ def comb(n, k):
 
 @njit
 def get_all_equal_weight_bits(n, k, dtype=np.int64):
-    """Get an array of all 'bits' (integers), with n bits, and k of them set."""
+    """Get an array of all 'bits' (integers), with n bits, and k of them set.
+    """
     if k == 0:
         return np.array([0], dtype=dtype)
 
@@ -1461,10 +1462,12 @@ def build_coo_numba(bits, coupling_map, parallel=False):
 
     from quimb import get_thread_pool
 
-    if isinstance(parallel, int):
+    if (parallel is True):
+        n_thread_workers = None
+    elif isinstance(parallel, int):
         n_thread_workers = parallel
     else:
-        n_thread_workers = None
+        raise ValueError(f"Unknown parallel option {parallel}.")
 
     pool = get_thread_pool(n_thread_workers)
     n_thread_workers = pool._max_workers
@@ -1527,8 +1530,7 @@ def fermi_hubbard_from_edges(edges, t=1.0, U=1.0, mu=0.0):
 
 
 def fermi_hubbard_spinless_from_edges(edges, t=1.0, mu=0.0):
-    """
-    """
+    """ """
     H = SparseOperatorBuilder()
     sites, edges = parse_edges_to_unique(edges)
 
@@ -1592,7 +1594,7 @@ def heisenberg_from_edges(edges, j=1.0, b=0.0, hilbert_space=None):
             H += jx, ("sx", cooa), ("sx", coob)
             H += jy, ("sy", cooa), ("sy", coob)
 
-        H += (jz, ("sz", "sz"), cooa, coob)
+        H += jz, ("sz", cooa), ("sz", coob)
 
     for site in sites:
         H += bx, ("sx", site)

@@ -5,24 +5,24 @@ from itertools import starmap
 
 import numpy as np
 import scipy.sparse.linalg as spla
-from opt_einsum import shared_intermediates
-from autoray import do, dag, conj, reshape
+from autoray import conj, dag, do, reshape
 
-from ..utils import pairwise, default_to_neutral_style
+from ..utils import default_to_neutral_style, pairwise
+from .contraction import contract_strategy
 from .drawing import get_colors
-from .tensor_core import Tensor, contract_strategy
 from .optimize import TNOptimizer
 from .tensor_2d import (
-    gen_2d_bonds,
-    calc_plaquette_sizes,
     calc_plaquette_map,
-    plaquette_to_sites,
+    calc_plaquette_sizes,
+    gen_2d_bonds,
     gen_long_range_path,
     gen_long_range_swap_path,
-    swap_path_to_long_range_path,
     nearest_neighbors,
+    plaquette_to_sites,
+    swap_path_to_long_range_path,
 )
 from .tensor_arbgeom_tebd import LocalHamGen, TEBDGen
+from .tensor_core import Tensor
 
 
 class LocalHam2D(LocalHamGen):
@@ -60,12 +60,12 @@ class LocalHam2D(LocalHamGen):
 
     """
 
-    def __init__(self, Lx, Ly, H2, H1=None):
+    def __init__(self, Lx, Ly, H2, H1=None, cyclic=False):
         self.Lx = int(Lx)
         self.Ly = int(Ly)
 
         # parse two site terms
-        if hasattr(H2, 'shape'):
+        if hasattr(H2, "shape"):
             # use as default nearest neighbour term
             H2 = {None: H2}
         else:
@@ -77,7 +77,7 @@ class LocalHam2D(LocalHamGen):
             for coo_a, coo_b in gen_2d_bonds(Lx, Ly, steppers=[
                 lambda i, j: (i, j + 1),
                 lambda i, j: (i + 1, j),
-            ]):
+            ], cyclic=cyclic):
                 if (coo_a, coo_b) not in H2 and (coo_b, coo_a) not in H2:
                     H2[coo_a, coo_b] = default_H2
 
@@ -102,7 +102,6 @@ class LocalHam2D(LocalHamGen):
         fontsize=8,
         legend=True,
         ax=None,
-        return_fig=False,
         **kwargs,
     ):
         """Plot this Hamiltonian as a network.
@@ -123,8 +122,6 @@ class LocalHam2D(LocalHamGen):
             Whether to show the legend of which terms are in which group.
         ax : None or matplotlib.Axes, optional
             Add to a existing set of axes.
-        return_fig : bool, optional
-            Whether to return any newly created figure.
         """
         import matplotlib.pyplot as plt
 
@@ -136,6 +133,8 @@ class LocalHam2D(LocalHamGen):
             fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
             ax.axis('off')
             ax.set_aspect('equal')
+        else:
+            fig = None
 
         if ordering is None or isinstance(ordering, str):
             ordering = self.get_auto_ordering(ordering, **kwargs)
@@ -196,13 +195,7 @@ class LocalHam2D(LocalHamGen):
             ax.legend(handles, lbls, ncol=max(round(len(handles) / 20), 1),
                       loc='center left', bbox_to_anchor=(1, 0.5))
 
-        if ax_supplied:
-            return
-
-        if return_fig:
-            return fig
-
-        plt.show()
+        return fig, ax
 
     graph = draw
 
@@ -703,7 +696,7 @@ def gate_full_update_als(
     x_previous = dict()
     previous_cost = None
 
-    with contract_strategy(optimize), shared_intermediates():
+    with contract_strategy(optimize):
         for i in range(steps):
 
             for site in tags_plq:

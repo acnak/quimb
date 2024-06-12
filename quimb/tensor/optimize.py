@@ -1,31 +1,31 @@
 """Support for optimizing tensor networks using automatic differentiation to
 automatically derive gradients for input to scipy optimizers.
 """
+
+import functools
+import importlib.util
 import re
 import warnings
-import functools
-import importlib
 from collections.abc import Iterable
 
-import tqdm
 import numpy as np
-from autoray import to_numpy, astype, get_dtype_name
+import tqdm
+from autoray import astype, get_dtype_name, to_numpy
 
-from .tensor_core import (
-    PTensor,
-    tags_to_oset,
+from ..core import prod
+from ..utils import (
+    default_to_neutral_style,
+    ensure_dict,
+    tree_flatten,
+    tree_map,
+    tree_unflatten,
 )
 from .contraction import contract_backend
 from .interface import get_jax
-from ..core import prod
-from ..utils import (
-    ensure_dict,
-    tree_map,
-    tree_flatten,
-    tree_unflatten,
-    default_to_neutral_style,
+from .tensor_core import (
+    TensorNetwork,
+    tags_to_oset,
 )
-
 
 if importlib.util.find_spec("jax") is not None:
     _DEFAULT_BACKEND = "jax"
@@ -194,7 +194,6 @@ def _parse_opt_in(tn, tags, shared_tags, to_constant):
 
     # handle shared tags
     for tag in shared_tags:
-
         var_name = _VARIABLE_TAG.format(len(variables))
         test_data = None
 
@@ -246,7 +245,6 @@ def _parse_opt_out(
     variables = []
 
     for t in tn_ag:
-
         if t.tags & constant_tags:
             t.modify(apply=to_constant)
             continue
@@ -258,6 +256,30 @@ def _parse_opt_out(
         t.add_tag(_VARIABLE_TAG.format(len(variables) - 1))
 
     return tn_ag, variables
+
+
+def _parse_pytree_to_backend(x, to_constant):
+    """Parse a arbitrary pytree, collecting variables. There is not opting in
+    or out, all networks, tensors and raw arrays are considered variables.
+    """
+    variables = []
+
+    def collect(x):
+        if hasattr(x, "get_params"):
+
+            if hasattr(x, "apply_to_arrays"):
+                x.apply_to_arrays(to_constant)
+
+            # variables can be a pytree
+            variables.append(x.get_params())
+            return x.copy()
+        else:
+            # raw array
+            variables.append(x)
+            return None
+
+    ref = tree_map(collect, x)
+    return ref, variables
 
 
 def parse_network_to_backend(
@@ -309,6 +331,15 @@ def parse_network_to_backend(
     shared_tags = tags_to_oset(shared_tags)
     constant_tags = tags_to_oset(constant_tags)
 
+    if not isinstance(tn, TensorNetwork):
+        if any((tags, shared_tags, constant_tags)):
+            raise ValueError(
+                "TNOptimizer error, if `tags`, `shared_tags`, or"
+                " `constant_tags` are specified then `tn` must be a"
+                " TensorNetwork, rather than a general pytree."
+            )
+        return _parse_pytree_to_backend(tn, to_constant=to_constant)
+
     if tags | shared_tags:
         # opt_in
         if not (tags & shared_tags) == shared_tags:
@@ -339,6 +370,37 @@ def parse_network_to_backend(
     )
 
 
+def _inject_variables_pytree(arrays, tree):
+    arrays = iter(arrays)
+
+    def inject(x):
+        if hasattr(x, "set_params"):
+            x.set_params(next(arrays))
+            return x
+        else:
+            return next(arrays)
+
+    return tree_map(inject, tree)
+
+
+def inject_variables(arrays, tn):
+    """Given the list of optimized variables ``arrays`` and the target tensor
+    network or pytree ``tn``, inject the variables back in.
+    """
+    if not isinstance(tn, TensorNetwork):
+        return _inject_variables_pytree(arrays, tn)
+
+    tn = tn.copy()
+    for t in tn:
+        for tag in t.tags:
+            match = variable_finder.match(tag)
+            if match is not None:
+                i = int(match.groups(1)[0])
+                t.set_params(arrays[i])
+                break
+    return tn
+
+
 def convert_raw_arrays(x, f):
     """Given a ``TensorNetwork``, ``Tensor``, or other possibly structured raw
     array, return a copy where the underyling data has had ``f``
@@ -364,6 +426,19 @@ def convert_raw_arrays(x, f):
 
     # other raw arrays
     return f(x)
+
+
+def convert_variables_to_numpy(x):
+    if hasattr(x, "apply_to_arrays"):
+        x.apply_to_arrays(to_numpy)
+        return x
+    elif hasattr(x, "get_params"):
+        old_params = x.get_params()
+        new_params = tree_map(to_numpy, old_params)
+        x.set_params(new_params)
+        return x
+    else:
+        return to_numpy(x)
 
 
 @functools.lru_cache(1)
@@ -669,16 +744,6 @@ class MultiLossHandler:
         return self._value_and_grad_seq(arrays)
 
 
-def inject_(arrays, tn):
-    for t in tn:
-        for tag in t.tags:
-            match = variable_finder.match(tag)
-            if match is not None:
-                i = int(match.groups(1)[0])
-                t.set_params(arrays[i])
-                break
-
-
 class SGD:
     """Stateful ``scipy.optimize.minimize`` compatible implementation of
     stochastic gradient descent with momentum.
@@ -711,7 +776,6 @@ class SGD:
         bounds=None,
         **kwargs,
     ):
-
         x = x0
         velocity = self.get_velocity(x)
 
@@ -1043,10 +1107,7 @@ class MakeArrayFn:
         self.autodiff_backend = autodiff_backend
 
     def __call__(self, arrays):
-        # copy the TN so norm and loss functions can modify in place
-        # XXX: make optional for efficiency?
-        tn_compute = self.tn_opt.copy()
-        inject_(arrays, tn_compute)
+        tn_compute = inject_variables(arrays, self.tn_opt)
 
         # set backend explicitly as maybe mixing with numpy arrays
         with contract_backend(self.autodiff_backend):
@@ -1322,8 +1383,7 @@ class TNOptimizer:
 
     @property
     def optimizer(self):
-        """The underlying optimizer that works with the vectorized functions.
-        """
+        """The underlying optimizer that works with the vectorized functions."""
         return self._optimizer
 
     @optimizer.setter
@@ -1361,17 +1421,13 @@ class TNOptimizer:
             self.handler.to_constant,
             self.vectorizer.unpack(),
         )
-        inject_(arrays, self._tn_opt)
-        tn = self.norm_fn(self._tn_opt.copy())
-        tn.drop_tags(t for t in tn.tags if variable_finder.match(t))
+        tn = inject_variables(arrays, self._tn_opt)
+        tn = self.norm_fn(tn)
 
-        for t in tn:
-            if isinstance(t, PTensor):
-                t.params = to_numpy(t.params)
-            else:
-                t.modify(data=to_numpy(t.data), left_inds=t.left_inds)
+        if isinstance(tn, TensorNetwork):
+            tn.drop_tags(t for t in tn.tags if variable_finder.match(t))
 
-        return tn
+        return tree_map(convert_variables_to_numpy, tn)
 
     def optimize(
         self, n, tol=None, jac=True, hessp=False, optlib="scipy", **options
@@ -1406,9 +1462,10 @@ class TNOptimizer:
         -------
         tn_opt : TensorNetwork
         """
-        return {"scipy": self.optimize_scipy, "nlopt": self.optimize_nlopt,}[
-            optlib
-        ](n=n, tol=tol, jac=jac, hessp=hessp, **options)
+        return {
+            "scipy": self.optimize_scipy,
+            "nlopt": self.optimize_nlopt,
+        }[optlib](n=n, tol=tol, jac=jac, hessp=hessp, **options)
 
     def optimize_scipy(self, n, tol=None, jac=True, hessp=False, **options):
         """Scipy based optimization, see
@@ -1738,6 +1795,7 @@ class TNOptimizer:
         ax.plot(xs, ys, ".-")
         if xscale == "symlog":
             ax.set_xscale(xscale, linthresh=xscale_linthresh)
+            ax.axvline(xscale_linthresh, color=(.5, .5, .5), ls="-", lw=0.5)
         else:
             ax.set_xscale(xscale)
         ax.set_xlabel("Iteration")

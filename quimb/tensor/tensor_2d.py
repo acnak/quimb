@@ -1,46 +1,46 @@
-"""Classes and algorithms related to 2D tensor networks.
-"""
-import re
-import random
-import functools
-from operator import add
-from numbers import Integral
-from itertools import product, cycle, combinations, count, chain
-from collections import defaultdict
+"""Classes and algorithms related to 2D tensor networks."""
 
-from autoray import do, infer_backend, get_dtype_name
-import opt_einsum as oe
+import functools
+import random
+import re
+from collections import defaultdict
+from itertools import chain, combinations, count, cycle, product
+from numbers import Integral
+from operator import add
+
+from autoray import do, get_dtype_name, infer_backend
 
 from ..gen.operators import swap
 from ..gen.rand import randn, seed_rand
 from ..utils import (
-    deprecated,
-    print_multi_line,
     check_opt,
-    pairwise,
+    deprecated,
     ensure_dict,
+    pairwise,
+    print_multi_line,
 )
 from ..utils import progbar as Progbar
 from . import array_ops as ops
-from .tensor_core import (
-    bonds_size,
-    bonds,
-    oset_union,
-    oset,
-    rand_uuid,
-    tags_to_oset,
-    tensor_contract,
-    Tensor,
-    TensorNetwork,
-)
+from . import decomp
+from .tensor_1d import maybe_factor_gate_into_tensor
 from .tensor_arbgeom import (
-    tensor_network_apply_op_vec,
     TensorNetworkGen,
     TensorNetworkGenOperator,
     TensorNetworkGenVector,
+    tensor_network_ag_sum,
+    tensor_network_apply_op_vec,
 )
-from .tensor_1d import maybe_factor_gate_into_tensor
-from . import decomp
+from .tensor_core import (
+    Tensor,
+    TensorNetwork,
+    bonds,
+    bonds_size,
+    oset,
+    oset_union,
+    rand_uuid,
+    tags_to_oset,
+    tensor_contract,
+)
 
 
 def manhattan_distance(coo_a, coo_b):
@@ -52,7 +52,7 @@ def nearest_neighbors(coo):
     return ((i - 1, j), (i, j - 1), (i, j + 1), (i + 1, j))
 
 
-def gen_2d_bonds(Lx, Ly, steppers=None, coo_filter=None):
+def gen_2d_bonds(Lx, Ly, steppers=None, coo_filter=None, cyclic=False):
     """Convenience function for tiling pairs of bond coordinates on a 2D
     lattice given a function like ``lambda i, j: (i + 1, j + 1)``.
 
@@ -106,11 +106,27 @@ def gen_2d_bonds(Lx, Ly, steppers=None, coo_filter=None):
     if callable(steppers):
         steppers = (steppers,)
 
+    try:
+        cyclic_x, cyclic_y = cyclic
+    except (TypeError, ValueError):
+        cyclic_x = cyclic_y = cyclic
+
+    def _maybe_wrap_coo(w, Lw, cyclic):
+        if 0 <= w < Lw:
+            return w
+        if cyclic:
+            return w % Lw
+        return None
+
     for i, j in product(range(Lx), range(Ly)):
         if (coo_filter is None) or coo_filter(i, j):
             for stepper in steppers:
                 i2, j2 = stepper(i, j)
-                if (0 <= i2 < Lx) and (0 <= j2 < Ly):
+
+                i2 = _maybe_wrap_coo(i2, Lx, cyclic_x)
+                j2 = _maybe_wrap_coo(j2, Ly, cyclic_y)
+
+                if (i2 is not None) and (j2 is not None):
                     yield (i, j), (i2, j2)
 
 
@@ -236,6 +252,8 @@ class Rotator2D:
             self.x_tag = tn.x_tag
             self.y_tag = tn.y_tag
             self.site_tag = tn.site_tag
+            self.is_cyclic_x = tn.is_cyclic_x
+            self.is_cyclic_y = tn.is_cyclic_y
         else:  # 'y'
             # -> rotate 90deg
             self.imin, self.imax = sorted(yrange)
@@ -243,6 +261,8 @@ class Rotator2D:
             self.y_tag = tn.x_tag
             self.x_tag = tn.y_tag
             self.site_tag = lambda i, j: tn.site_tag(j, i)
+            self.is_cyclic_x = tn.is_cyclic_y
+            self.is_cyclic_y = tn.is_cyclic_x
 
         if "min" in self.from_which:
             # -> sweeps are increasing
@@ -253,7 +273,35 @@ class Rotator2D:
             self.sweep = range(self.imax, self.imin - 1, -stepsize)
             self.istep = -stepsize
 
-        self.sweep_other = range(self.jmin, self.jmax + 1)
+    @functools.cached_property
+    def sweep_other(self):
+        return range(self.jmin, self.jmax + 1)
+
+    @functools.cached_property
+    def cyclic_x(self):
+        return self.is_cyclic_x(
+            (self.jmin + self.jmax) // 2,
+            self.imin,
+            self.imax,
+        )
+
+    @functools.cached_property
+    def cyclic_y(self):
+        return self.is_cyclic_y(
+            (self.imin + self.imax) // 2,
+            self.jmin,
+            self.jmax,
+        )
+
+    def get_jnext(self, j):
+        if j == self.jmax:
+            if self.cyclic_y:
+                # wrap around
+                return self.jmin
+            # no more steps
+            return None
+        # normal step
+        return j + 1
 
     def get_opposite_env_fn(self):
         """Get the function and location label for contracting boundaries in
@@ -481,6 +529,7 @@ class TensorNetwork2D(TensorNetworkGen):
             self.Lx,
             self.Ly,
             steppers=[lambda i, j: (i, j + 1), lambda i, j: (i + 1, j)],
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_horizontal_bond_coos(self):
@@ -491,6 +540,7 @@ class TensorNetwork2D(TensorNetworkGen):
             steppers=[
                 lambda i, j: (i, j + 1),
             ],
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_horizontal_even_bond_coos(self):
@@ -504,6 +554,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i, j + 1),
             ],
             coo_filter=lambda i, j: j % 2 == 0,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_horizontal_odd_bond_coos(self):
@@ -517,6 +568,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i, j + 1),
             ],
             coo_filter=lambda i, j: j % 2 == 1,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_vertical_bond_coos(self):
@@ -527,6 +579,7 @@ class TensorNetwork2D(TensorNetworkGen):
             steppers=[
                 lambda i, j: (i + 1, j),
             ],
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_vertical_even_bond_coos(self):
@@ -540,6 +593,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j),
             ],
             coo_filter=lambda i, j: i % 2 == 0,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_vertical_odd_bond_coos(self):
@@ -553,6 +607,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j),
             ],
             coo_filter=lambda i, j: i % 2 == 1,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_left_bond_coos(self):
@@ -563,6 +618,7 @@ class TensorNetwork2D(TensorNetworkGen):
             steppers=[
                 lambda i, j: (i + 1, j - 1),
             ],
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_left_even_bond_coos(self):
@@ -576,6 +632,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j - 1),
             ],
             coo_filter=lambda i, j: j % 2 == 0,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_left_odd_bond_coos(self):
@@ -589,6 +646,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j - 1),
             ],
             coo_filter=lambda i, j: j % 2 == 1,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_right_bond_coos(self):
@@ -599,6 +657,7 @@ class TensorNetwork2D(TensorNetworkGen):
             steppers=[
                 lambda i, j: (i + 1, j + 1),
             ],
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_right_even_bond_coos(self):
@@ -612,6 +671,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j + 1),
             ],
             coo_filter=lambda i, j: i % 2 == 0,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_right_odd_bond_coos(self):
@@ -625,6 +685,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j + 1),
             ],
             coo_filter=lambda i, j: i % 2 == 1,
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def gen_diagonal_bond_coos(self):
@@ -636,6 +697,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 lambda i, j: (i + 1, j - 1),
                 lambda i, j: (i + 1, j + 1),
             ],
+            cyclic=(self.is_cyclic_x(), self.is_cyclic_y()),
         )
 
     def valid_coo(self, coo, xrange=None, yrange=None):
@@ -674,6 +736,58 @@ class TensorNetwork2D(TensorNetworkGen):
             xmax = max(i, xmax)
             ymax = max(j, ymax)
         return (xmin, xmax), (ymin, ymax)
+
+    def is_cyclic_x(self, j=None, imin=None, imax=None):
+        """Check if the x dimension is cyclic (periodic), specifically whether
+        a bond exists between ``(imin, j)`` and ``(imax, j)``, with default
+        values of ``imin = 0`` and ``imax = Lx - 1``, and ``j`` at the center
+        of the lattice. If ``imin`` and ``imax`` are adjacent then this is
+        considered False, since there is no 'extra' connectivity.
+        """
+        if imin is None:
+            imin = 0
+        if imax is None:
+            imax = self.Lx - 1
+
+        if abs(imax - imin) <= 1:
+            # first and last sites already connected -> a bit undefined
+            return False
+
+        if j is None:
+            j = self.Ly // 2
+
+        return bool(
+            bonds(
+                self[self.site_tag(imin, j)],
+                self[self.site_tag(imax, j)],
+            )
+        )
+
+    def is_cyclic_y(self, i=None, jmin=None, jmax=None):
+        """Check if the y dimension is cyclic (periodic), specifically whether
+        a bond exists between ``(i, jmin)`` and ``(i, jmax)``, with default
+        values of ``jmin = 0`` and ``jmax = Ly - 1``, and ``i`` at the center
+        of the lattice. If ``jmin`` and ``jmax`` are adjacent then this is
+        considered False, since there is no 'extra' connectivity.
+        """
+        if jmin is None:
+            jmin = 0
+        if jmax is None:
+            jmax = self.Ly - 1
+
+        if abs(jmax - jmin) <= 1:
+            # first and last sites already connected -> a bit undefined
+            return False
+
+        if i is None:
+            i = self.Lx // 2
+
+        return bool(
+            bonds(
+                self[self.site_tag(i, jmin)],
+                self[self.site_tag(i, jmax)],
+            )
+        )
 
     def __getitem__(self, key):
         """Key based tensor selection, checking for integer based shortcut."""
@@ -962,6 +1076,7 @@ class TensorNetwork2D(TensorNetworkGen):
         """
         compress_opts = ensure_dict(compress_opts)
         compress_opts.setdefault("absorb", "right")
+        compress_opts.setdefault("reduced", "left")
         compress_opts.setdefault("equalize_norms", equalize_norms)
 
         pairs = self.gen_pairs(
@@ -1133,6 +1248,72 @@ class TensorNetwork2D(TensorNetworkGen):
             equalize_norms=equalize_norms,
             compress_opts=compress_opts,
         )
+
+    def _contract_boundary_core_via_1d(
+        self,
+        xrange,
+        yrange,
+        from_which,
+        max_bond,
+        cutoff=1e-10,
+        method="dm",
+        layer_tags=None,
+        **compress_opts,
+    ):
+        from quimb.tensor.tensor_1d_compress import tensor_network_1d_compress
+
+        r2d = Rotator2D(self, xrange, yrange, from_which)
+        site_tag = r2d.site_tag
+        istep = r2d.istep
+
+        def _do_compress(site_tag_tmps):
+            nonlocal self
+
+            # split off the boundary network
+            self, tn_boundary = self.partition(site_tag_tmps, inplace=True)
+
+            # compress it inplace
+            tensor_network_1d_compress(
+                tn_boundary,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                method=method,
+                site_tags=site_tag_tmps,
+                inplace=True,
+                **compress_opts,
+            )
+
+            # recombine with the main network
+            self |= tn_boundary
+
+        # maybe compress the initial row, which may be multiple layers
+        # and have effective bond dimension > max_bond already
+        site_tag_tmps = [site_tag(r2d.sweep[0], j) for j in r2d.sweep_other]
+        if any(len(self.tag_map[st]) > 1 for st in site_tag_tmps):
+            _do_compress(site_tag_tmps)
+
+        site_tag_tmps = [f"__ST{j}__" for j in r2d.sweep_other]
+
+        if layer_tags is None:
+            layer_tags = [None]
+
+        for i in r2d.sweep[:-1]:
+            for layer_tag in layer_tags:
+                for j, st in zip(r2d.sweep_other, site_tag_tmps):
+                    # group outer single tensor with inner tensor(s)
+                    tag1 = site_tag(i, j)  # outer
+                    tag2 = site_tag(i + istep, j)  # inner
+                    if layer_tag is None:
+                        # tag and compress any inner tensors
+                        self.select_any((tag1, tag2)).add_tag(st)
+                    else:
+                        # only tag and compress one inner layer
+                        self.select_all((tag1,)).add_tag(st)
+                        self.select_all((tag2, layer_tag)).add_tag(st)
+
+                _do_compress(site_tag_tmps)
+
+        self.drop_tags(site_tag_tmps)
 
     def _contract_boundary_core(
         self,
@@ -1489,25 +1670,23 @@ class TensorNetwork2D(TensorNetworkGen):
         compress_opts = ensure_dict(compress_opts)
 
         r = Rotator2D(self, xrange, yrange, from_which)
-        j0 = r.sweep_other[0]
 
-        for i0, i1 in pairwise(r.sweep):
+        for i, inext in pairwise(r.sweep):
             # we compute the projectors from an untouched copy
             tn_calc = self.copy()
 
             for j in r.sweep_other:
-                tag_ij = r.site_tag(i0, j)
-                tag_ip1j = r.site_tag(i1, j)
-
-                if j != j0:
-                    ltags = r.site_tag(i0, j - 1), r.site_tag(i1, j - 1)
-                    rtags = (tag_ij, tag_ip1j)
+                # this handles cyclic boundary conditions
+                jnext = r.get_jnext(j)
+                if jnext is not None:
+                    ltags = (r.site_tag(i, j), r.site_tag(inext, j))
+                    rtags = (r.site_tag(i, jnext), r.site_tag(inext, jnext))
                     #      │         │
                     #    ──O─┐ chi ┌─O──  i+1
                     #      │ └─▷═◁─┘ │
                     #      │ ┌┘   └┐ │
                     #    ──O─┘     └─O──  i
-                    #     j-1        j
+                    #      j        j+1
                     tn_calc.insert_compressor_between_regions(
                         ltags,
                         rtags,
@@ -1523,12 +1702,12 @@ class TensorNetwork2D(TensorNetworkGen):
                 # contract each pair of boundary tensors with their projectors
                 for j in r.sweep_other:
                     self.contract_tags_(
-                        (r.site_tag(i0, j), r.site_tag(i1, j)),
+                        (r.site_tag(i, j), r.site_tag(inext, j)),
                         optimize=optimize,
                     )
 
             if equalize_norms:
-                for t in self.select_tensors(r.x_tag(i1)):
+                for t in self.select_tensors(r.x_tag(inext)):
                     self.strip_exponent(t, equalize_norms)
 
     def contract_boundary_from(
@@ -1550,7 +1729,7 @@ class TensorNetwork2D(TensorNetworkGen):
         """Unified entrypoint for contracting any rectangular patch of tensors
         from any direction, with any boundary method.
         """
-        check_opt("mode", mode, ("mps", "projector", "full-bond"))
+        # check_opt("mode", mode, ("mps", "projector", "full-bond"))
 
         tn = self if inplace else self.copy()
 
@@ -1567,7 +1746,7 @@ class TensorNetwork2D(TensorNetworkGen):
         contract_boundary_opts["cutoff"] = cutoff
         contract_boundary_opts["compress_opts"] = compress_opts
 
-        if mode == "projector":
+        if mode == "projector2d":
             tn._contract_boundary_projector(**contract_boundary_opts)
             return tn
 
@@ -1575,8 +1754,14 @@ class TensorNetwork2D(TensorNetworkGen):
         contract_boundary_opts["canonize"] = canonize
         contract_boundary_opts["layer_tags"] = layer_tags
         contract_boundary_opts["sweep_reverse"] = sweep_reverse
-        tn._contract_boundary_core(**contract_boundary_opts)
 
+        if mode == "mps":
+            tn._contract_boundary_core(**contract_boundary_opts)
+            return tn
+
+        tn._contract_boundary_core_via_1d(
+            method=mode, **contract_boundary_opts
+        )
         return tn
 
     contract_boundary_from_ = functools.partialmethod(
@@ -2163,9 +2348,15 @@ class TensorNetwork2D(TensorNetworkGen):
         if sequence is None:
             # contract in both sides along short dimension -> less compression
             if self.Lx >= self.Ly:
-                sequence = ("xmin", "xmax")
+                if self.is_cyclic_x():
+                    sequence = ("xmin",)
+                else:
+                    sequence = ("xmin", "xmax")
             else:
-                sequence = ("ymin", "ymax")
+                if self.is_cyclic_y():
+                    sequence = ("ymin",)
+                else:
+                    sequence = ("ymin", "ymax")
         else:
             sequence = parse_boundary_sequence(sequence)
 
@@ -2275,6 +2466,7 @@ class TensorNetwork2D(TensorNetworkGen):
         ymin=None,
         ymax=None,
         max_separation=1,
+        max_unfinished=1,
         around=None,
         equalize_norms=False,
         final_contract=True,
@@ -2335,6 +2527,9 @@ class TensorNetwork2D(TensorNetworkGen):
         max_separation : int, optional
             If ``around is None``, when any two sides become this far apart
             simply contract the remaining tensor network.
+        max_unfinished : int, optional
+            If ``around is None``, when this many sides are still not within
+            ``max_separation`` simply contract the remaining tensor network.
         around : None or sequence of (int, int), optional
             If given, don't contract the square of sites bounding these
             coordinates.
@@ -2377,6 +2572,7 @@ class TensorNetwork2D(TensorNetworkGen):
             ymin=ymin,
             ymax=ymax,
             max_separation=max_separation,
+            max_unfinished=max_unfinished,
             around=around,
             equalize_norms=equalize_norms,
             final_contract=final_contract,
@@ -2430,6 +2626,10 @@ class TensorNetwork2D(TensorNetworkGen):
             sequence=[direction],
             **contract_boundary_opts,
         )
+
+    contract_mps_sweep_ = functools.partialmethod(
+        contract_mps_sweep, inplace=True
+    )
 
     def contract_full_bootstrap(self, n, *, optimize="auto-hq", **kwargs):
         if n < 2:
@@ -3205,32 +3405,36 @@ class TensorNetwork2D(TensorNetworkGen):
         tn = self if inplace else self.copy()
         tn_calc = tn.copy()
 
-        r = Rotator2D(tn, None, None, direction + "min")
+        r = Rotator2D(tn, None, None, f"{direction}min")
 
         # track new coordinates / tags
         retag_map = {}
 
         for i in range(r.imin, r.imax + 1, 2):
-            next_i_in_lattice = i + 1 <= r.imax
+            inext = i + 1
+            next_i_in_lattice = inext <= r.imax
 
-            for j in range(r.jmin, r.jmax + 1):
+            for j in r.sweep_other:
+                # handles cyclic case
+                jnext = r.get_jnext(j)
+
                 #      │         │
                 #    ──O─┐ chi ┌─O──  i+1
                 #      │ └─▷═◁─┘ │
                 #      │ ┌┘   └┐ │
                 #    ──O─┘     └─O──  i
                 #      │         │
-                #     j-1        j
+                #      j        j+1
                 tag_ij = r.site_tag(i, j)
-                tag_ip1j = r.site_tag(i + 1, j)
+                tag_ip1j = r.site_tag(inext, j)
                 new_tag = r.site_tag(i // 2, j)
                 retag_map[tag_ij] = new_tag
                 if next_i_in_lattice:
                     retag_map[tag_ip1j] = new_tag
 
-                if (j > 0) and next_i_in_lattice:
-                    ltags = r.site_tag(i, j - 1), r.site_tag(i + 1, j - 1)
-                    rtags = (tag_ij, tag_ip1j)
+                if next_i_in_lattice and jnext is not None:
+                    ltags = (tag_ij, tag_ip1j)
+                    rtags = r.site_tag(i, jnext), r.site_tag(inext, jnext)
                     tn_calc.insert_compressor_between_regions(
                         ltags,
                         rtags,
@@ -3244,7 +3448,7 @@ class TensorNetwork2D(TensorNetworkGen):
 
             retag_map[r.x_tag(i)] = r.x_tag(i // 2)
             if next_i_in_lattice:
-                retag_map[r.x_tag(i + 1)] = r.x_tag(i // 2)
+                retag_map[r.x_tag(inext)] = r.x_tag(i // 2)
 
         # then we retag the tensor network and adjust its size
         tn.retag_(retag_map)
@@ -3425,7 +3629,7 @@ class TensorNetwork2D(TensorNetworkGen):
         lazy=False,
         mode="projector",
         compress_opts=None,
-        sequence=("xmin", "xmax", "ymin", "ymax"),
+        sequence=None,
         xmin=None,
         xmax=None,
         ymin=None,
@@ -3522,6 +3726,17 @@ class TensorNetwork2D(TensorNetworkGen):
         if lazy:
             # we are implicitly asking for the tensor network
             final_contract = False
+
+        if sequence is None:
+            sequence = []
+            if self.is_cyclic_x():
+                sequence.append("xmin")
+            else:
+                sequence.extend(["xmin", "xmax"])
+            if self.is_cyclic_y():
+                sequence.append("ymin")
+            else:
+                sequence.extend(["ymin", "ymax"])
 
         return self._contract_interleaved_boundary_sequence(
             contract_boundary_opts=contract_boundary_opts,
@@ -4282,22 +4497,21 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             ket_local.view_as_(TensorNetwork2DVector, like=self)
             bra_and_env = bra.select_any(sites) | plaquette_envs[p]
 
-            with oe.shared_intermediates():
-                # compute local estimation of norm for this plaquette
-                if normalized:
-                    norm_i0j0 = (ket_local | bra_and_env).contract(
-                        all, optimize=contract_optimize
-                    )
-                else:
-                    norm_i0j0 = None
+            # compute local estimation of norm for this plaquette
+            if normalized:
+                norm_i0j0 = (ket_local | bra_and_env).contract(
+                    all, optimize=contract_optimize
+                )
+            else:
+                norm_i0j0 = None
 
-                # for each local term on plaquette compute expectation
-                for where, G in plaq2coo[p]:
-                    expec_ij = (
-                        ket_local.gate(G, where, contract=False) | bra_and_env
-                    ).contract(all, optimize=contract_optimize)
+            # for each local term on plaquette compute expectation
+            for where, G in plaq2coo[p]:
+                expec_ij = (
+                    ket_local.gate(G, where, contract=False) | bra_and_env
+                ).contract(all, optimize=contract_optimize)
 
-                    expecs[where] = expec_ij, norm_i0j0
+                expecs[where] = expec_ij, norm_i0j0
 
         if return_all:
             return expecs
@@ -4489,7 +4703,9 @@ class TensorNetwork2DFlat(TensorNetwork2D):
         return b_ix
 
     def bond_size(self, coo1, coo2):
-        """Return the size of the bond between sites at ``coo1`` and ``coo2``."""
+        """Return the (combined) size of the bond(s) between sites at ``coo1``
+        and ``coo2``.
+        """
         b_ix = self.bond(coo1, coo2)
         return self[coo1].ind_size(b_ix)
 
@@ -4593,7 +4809,7 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
 
     Parameters
     ----------
-    arrays : sequence of sequence of array
+    arrays : sequence of sequence of array_like
         The core tensor data arrays.
     shape : str, optional
         Which order the dimensions of the arrays are stored in, the default
@@ -4646,10 +4862,13 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
         arrays = tuple(tuple(x for x in xs) for xs in arrays)
         self._Lx = len(arrays)
         self._Ly = len(arrays[0])
-        tensors = []
+
+        cyclicx = sum(d > 1 for d in arrays[0][1].shape) == 5
+        cyclicy = sum(d > 1 for d in arrays[1][0].shape) == 5
 
         # cache for both creating and retrieving indices
         ix = defaultdict(rand_uuid)
+        tensors = []
 
         for i, j in self.gen_site_coos():
             array = arrays[i][j]
@@ -4657,13 +4876,13 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
             # figure out if we need to transpose the arrays from some order
             #     other than up right down left physical
             array_order = shape
-            if i == self.Lx - 1:
+            if (not cyclicx) and (i == self.Lx - 1):
                 array_order = array_order.replace("u", "")
-            if j == self.Ly - 1:
+            if (not cyclicy) and (j == self.Ly - 1):
                 array_order = array_order.replace("r", "")
-            if i == 0:
+            if (not cyclicx) and (i == 0):
                 array_order = array_order.replace("d", "")
-            if j == 0:
+            if (not cyclicy) and (j == 0):
                 array_order = array_order.replace("l", "")
 
             # allow convention of missing bonds to be singlet dimensions
@@ -4679,17 +4898,20 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
             # get the relevant indices corresponding to neighbours
             inds = []
             if "u" in array_order:
-                inds.append(ix[(i, j), (i + 1, j)])
+                i_u = (i + 1) % self.Lx
+                inds.append(ix[frozenset(((i, j), (i_u, j)))])
             if "r" in array_order:
-                inds.append(ix[(i, j), (i, j + 1)])
+                j_r = (j + 1) % self.Ly
+                inds.append(ix[frozenset(((i, j), (i, j_r)))])
             if "d" in array_order:
-                inds.append(ix[(i - 1, j), (i, j)])
+                i_d = (i - 1) % self.Lx
+                inds.append(ix[frozenset(((i_d, j), (i, j)))])
             if "l" in array_order:
-                inds.append(ix[(i, j - 1), (i, j)])
+                j_l = (j - 1) % self.Ly
+                inds.append(ix[frozenset(((i, j_l), (i, j)))])
             inds.append(self.site_ind(i, j))
 
             # mix site, row, column and global tags
-
             ij_tags = tags | oset(
                 (self.site_tag(i, j), self.x_tag(i), self.y_tag(j))
             )
@@ -4700,7 +4922,17 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
         super().__init__(tensors, virtual=True, **tn_opts)
 
     @classmethod
-    def from_fill_fn(cls, fill_fn, Lx, Ly, bond_dim, phys_dim=2, **peps_opts):
+    def from_fill_fn(
+        cls,
+        fill_fn,
+        Lx,
+        Ly,
+        bond_dim,
+        phys_dim=2,
+        cyclic=False,
+        shape="urdlp",
+        **peps_opts,
+    ):
         """Create a 2D PEPS from a filling function with signature
         ``fill_fn(shape)``.
 
@@ -4712,8 +4944,14 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
             The number of columns.
         bond_dim : int
             The bond dimension.
-        physical : int, optional
+        phys_dim : int, optional
             The physical index dimension.
+        cyclic : bool or tuple[bool, bool], optional
+            Whether the lattice is cyclic in the x and y directions.
+        shape : str, optional
+            How to layout the indices of the tensors, the default is
+            ``(up, right, down, left, phys) == 'urdlbk'``. This is the order
+            of the shape supplied to the filling function.
         peps_opts
             Supplied to :class:`~quimb.tensor.tensor_2d.PEPS`.
 
@@ -4723,21 +4961,31 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
         """
         arrays = [[None for _ in range(Ly)] for _ in range(Lx)]
 
+        try:
+            cyclicx, cyclicy = cyclic
+        except (TypeError, ValueError):
+            cyclicx = cyclicy = cyclic
+
         for i, j in product(range(Lx), range(Ly)):
-            shape = []
-            if i != Lx - 1:  # bond up
-                shape.append(bond_dim)
-            if j != Ly - 1:  # bond right
-                shape.append(bond_dim)
-            if i != 0:  # bond down
-                shape.append(bond_dim)
-            if j != 0:  # bond left
-                shape.append(bond_dim)
-            shape.append(phys_dim)
+            shp = []
 
-            arrays[i][j] = fill_fn(shape)
+            for which in shape:
+                if (which == "u") and (cyclicx or (i < Lx - 1)):  # bond up
+                    shp.append(bond_dim)
+                elif (which == "r") and (
+                    cyclicy or (j < Ly - 1)
+                ):  # bond right
+                    shp.append(bond_dim)
+                elif (which == "d") and (cyclicx or (i > 0)):  # bond down
+                    shp.append(bond_dim)
+                elif (which == "l") and (cyclicy or (j > 0)):  # bond left
+                    shp.append(bond_dim)
+                elif which == "p":
+                    shp.append(phys_dim)
 
-        return cls(arrays, **peps_opts)
+            arrays[i][j] = fill_fn(shp)
+
+        return cls(arrays, shape=shape, **peps_opts)
 
     @classmethod
     def empty(cls, Lx, Ly, bond_dim, phys_dim=2, like="numpy", **peps_opts):
@@ -4809,7 +5057,16 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
 
     @classmethod
     def rand(
-        cls, Lx, Ly, bond_dim, phys_dim=2, dtype=float, seed=None, **peps_opts
+        cls,
+        Lx,
+        Ly,
+        bond_dim,
+        phys_dim=2,
+        dist="normal",
+        loc=0.0,
+        dtype="float64",
+        seed=None,
+        **peps_opts,
     ):
         """Create a random (un-normalized) PEPS.
 
@@ -4823,6 +5080,10 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
             The bond dimension.
         physical : int, optional
             The physical index dimension.
+        dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+            Type of random number to generate, defaults to 'normal'.
+        loc : float, optional
+            An additive offset to add to the random numbers.
         dtype : dtype, optional
             The dtype to create the arrays with, default is real double.
         seed : int, optional
@@ -4843,7 +5104,9 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
 
         def fill_fn(shape):
             return ops.sensibly_scale(
-                ops.sensibly_scale(randn(shape, dtype=dtype))
+                ops.sensibly_scale(
+                    randn(shape, dist=dist, loc=loc, dtype=dtype)
+                )
             )
 
         return cls.from_fill_fn(
@@ -4851,46 +5114,9 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
         )
 
     def add_PEPS(self, other, inplace=False):
-        """Add this PEPS with another."""
-        if (self.Lx, self.Ly) != (other.Lx, other.Ly):
-            raise ValueError("PEPS must be the same size.")
-
-        peps = self if inplace else self.copy()
-        for coo in peps.gen_site_coos():
-            t1, t2 = peps[coo], other[coo]
-
-            if set(t1.inds) != set(t2.inds):
-                # Need to use bonds to match indices
-                reindex_map = {}
-                i, j = coo
-                if i > 0:
-                    pair = ((i - 1, j), (i, j))
-                    reindex_map[other.bond(*pair)] = peps.bond(*pair)
-                if i < self.Lx - 1:
-                    pair = ((i, j), (i + 1, j))
-                    reindex_map[other.bond(*pair)] = peps.bond(*pair)
-                if j > 0:
-                    pair = ((i, j - 1), (i, j))
-                    reindex_map[other.bond(*pair)] = peps.bond(*pair)
-                if j < self.Ly - 1:
-                    pair = ((i, j), (i, j + 1))
-                    reindex_map[other.bond(*pair)] = peps.bond(*pair)
-
-                t2 = t2.reindex(reindex_map)
-
-            t1.direct_product_(t2, sum_inds=peps.site_ind(*coo))
-
-        return peps
+        return tensor_network_ag_sum(self, other, inplace=inplace)
 
     add_PEPS_ = functools.partialmethod(add_PEPS, inplace=True)
-
-    def __add__(self, other):
-        """PEPS addition."""
-        return self.add_PEPS(other, inplace=False)
-
-    def __iadd__(self, other):
-        """In-place PEPS addition."""
-        return self.add_PEPS(other, inplace=True)
 
     def show(self):
         """Print a unicode schematic of this PEPS and its bond dimensions."""
@@ -4975,10 +5201,13 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
         arrays = tuple(tuple(x for x in xs) for xs in arrays)
         self._Lx = len(arrays)
         self._Ly = len(arrays[0])
-        tensors = []
 
         # cache for both creating and retrieving indices
         ix = defaultdict(rand_uuid)
+        tensors = []
+
+        cyclicx = sum(d > 1 for d in arrays[0][1].shape) == 6
+        cyclicy = sum(d > 1 for d in arrays[1][0].shape) == 6
 
         for i, j in product(range(self.Lx), range(self.Ly)):
             array = arrays[i][j]
@@ -4986,13 +5215,13 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
             # figure out if we need to transpose the arrays from some order
             #     other than up right down left physical
             array_order = shape
-            if i == self.Lx - 1:
+            if (not cyclicx) and (i == self.Lx - 1):
                 array_order = array_order.replace("u", "")
-            if j == self.Ly - 1:
+            if (not cyclicy) and (j == self.Ly - 1):
                 array_order = array_order.replace("r", "")
-            if i == 0:
+            if (not cyclicx) and (i == 0):
                 array_order = array_order.replace("d", "")
-            if j == 0:
+            if (not cyclicy) and (j == 0):
                 array_order = array_order.replace("l", "")
 
             # allow convention of missing bonds to be singlet dimensions
@@ -5008,13 +5237,17 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
             # get the relevant indices corresponding to neighbours
             inds = []
             if "u" in array_order:
-                inds.append(ix[(i + 1, j), (i, j)])
+                i_u = (i + 1) % self.Lx
+                inds.append(ix[frozenset(((i, j), (i_u, j)))])
             if "r" in array_order:
-                inds.append(ix[(i, j), (i, j + 1)])
+                j_r = (j + 1) % self.Ly
+                inds.append(ix[frozenset(((i, j), (i, j_r)))])
             if "d" in array_order:
-                inds.append(ix[(i, j), (i - 1, j)])
+                i_d = (i - 1) % self.Lx
+                inds.append(ix[frozenset(((i_d, j), (i, j)))])
             if "l" in array_order:
-                inds.append(ix[(i, j - 1), (i, j)])
+                j_l = (j - 1) % self.Ly
+                inds.append(ix[frozenset(((i, j_l), (i, j)))])
             inds.append(self.lower_ind(i, j))
             inds.append(self.upper_ind(i, j))
 
@@ -5029,6 +5262,66 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
         super().__init__(tensors, virtual=True, **tn_opts)
 
     @classmethod
+    def from_fill_fn(
+        cls,
+        fill_fn,
+        Lx,
+        Ly,
+        bond_dim,
+        phys_dim=2,
+        cyclic=False,
+        shape="urdlbk",
+        **pepo_opts,
+    ):
+        """Create a PEPO and fill the tensor entries with a supplied function
+        matching signature ``fill_fn(shape) -> array``.
+
+        Parameters
+        ----------
+        fill_fn : callable
+            A function that takes a shape tuple and returns a data array.
+        Lx : int
+            The number of rows.
+        Ly : int
+            The number of columns.
+        bond_dim : int
+            The bond dimension.
+        phys_dim : int, optional
+            The physical indices dimension.
+        cyclic : bool or tuple[bool, bool], optional
+            Whether the lattice is cyclic in the x and y directions.
+        shape : str, optional
+            How to layout the indices of the tensors, the default is
+            ``(up, right, down, left bra, ket) == 'urdlbk'``.
+        pepo_opts
+            Supplied to :class:`~quimb.tensor.tensor_2d.PEPO`.
+        """
+        arrays = [[None for _ in range(Ly)] for _ in range(Lx)]
+
+        try:
+            cyclicx, cyclicy = cyclic
+        except (TypeError, ValueError):
+            cyclicx = cyclicy = cyclic
+
+        for i, j in product(range(Lx), range(Ly)):
+            shp = []
+            for which in shape:
+                if (which == "u") and (cyclicx or (i < Lx - 1)):
+                    shp.append(bond_dim)
+                elif (which == "r") and (cyclicy or (j < Ly - 1)):
+                    shp.append(bond_dim)
+                elif (which == "d") and (cyclicx or (i > 0)):
+                    shp.append(bond_dim)
+                elif (which == "l") and (cyclicy or (j > 0)):
+                    shp.append(bond_dim)
+                elif which in ("b", "k"):
+                    shp.append(phys_dim)
+
+            arrays[i][j] = fill_fn(shp)
+
+        return cls(arrays, shape=shape, **pepo_opts)
+
+    @classmethod
     def rand(
         cls,
         Lx,
@@ -5036,7 +5329,9 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
         bond_dim,
         phys_dim=2,
         herm=False,
-        dtype=float,
+        dist="normal",
+        loc=0.0,
+        dtype="float64",
         seed=None,
         **pepo_opts,
     ):
@@ -5069,80 +5364,87 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
         if seed is not None:
             seed_rand(seed)
 
-        arrays = [[None for _ in range(Ly)] for _ in range(Lx)]
-
-        for i, j in product(range(Lx), range(Ly)):
-            shape = []
-            if i != Lx - 1:  # bond up
-                shape.append(bond_dim)
-            if j != Ly - 1:  # bond right
-                shape.append(bond_dim)
-            if i != 0:  # bond down
-                shape.append(bond_dim)
-            if j != 0:  # bond left
-                shape.append(bond_dim)
-            shape.append(phys_dim)
-            shape.append(phys_dim)
-
+        def fill_fn(shape):
             X = ops.sensibly_scale(
-                ops.sensibly_scale(randn(shape, dtype=dtype))
+                ops.sensibly_scale(
+                    randn(shape, dist=dist, loc=loc, dtype=dtype)
+                )
             )
-
             if herm:
                 new_order = list(range(len(shape)))
                 new_order[-2], new_order[-1] = new_order[-1], new_order[-2]
                 X = (do("conj", X) + do("transpose", X, new_order)) / 2
+            return X
 
-            arrays[i][j] = X
-
-        return cls(arrays, **pepo_opts)
+        return cls.from_fill_fn(
+            fill_fn,
+            Lx=Lx,
+            Ly=Ly,
+            bond_dim=bond_dim,
+            phys_dim=phys_dim,
+            **pepo_opts,
+        )
 
     rand_herm = functools.partialmethod(rand, herm=True)
 
+    @classmethod
+    def zeros(
+        cls,
+        Lx,
+        Ly,
+        bond_dim,
+        phys_dim=2,
+        dtype="float64",
+        backend="numpy",
+        **pepo_opts,
+    ):
+        """Create a PEPO with all zero entries.
+
+        Parameters
+        ----------
+        Lx : int
+            The number of rows.
+        Ly : int
+            The number of columns.
+        bond_dim : int
+            The bond dimension.
+        physical : int, optional
+            The physical index dimension.
+        dtype : dtype, optional
+            The dtype to create the arrays with, default is real double.
+        backend : str, optional
+            Which backend to use, default is ``'numpy'``.
+        pepo_opts
+            Supplied to :class:`~quimb.tensor.tensor_2d.PEPO`.
+        """
+
+        def fill_fn(shape):
+            return do("zeros", shape, dtype=dtype, like=backend)
+
+        return cls.from_fill_fn(
+            fill_fn,
+            Lx=Lx,
+            Ly=Ly,
+            bond_dim=bond_dim,
+            phys_dim=phys_dim,
+            **pepo_opts,
+        )
+
     def add_PEPO(self, other, inplace=False):
-        """Add this PEPO with another."""
-        if (self.Lx, self.Ly) != (other.Lx, other.Ly):
-            raise ValueError("PEPOs must be the same size.")
-
-        pepo = self if inplace else self.copy()
-        for coo in pepo.gen_site_coos():
-            t1, t2 = pepo[coo], other[coo]
-
-            if set(t1.inds) != set(t2.inds):
-                # Need to use bonds to match indices
-                reindex_map = {}
-                i, j = coo
-                if i > 0:
-                    pair = ((i - 1, j), (i, j))
-                    reindex_map[other.bond(*pair)] = pepo.bond(*pair)
-                if i < self.Lx - 1:
-                    pair = ((i, j), (i + 1, j))
-                    reindex_map[other.bond(*pair)] = pepo.bond(*pair)
-                if j > 0:
-                    pair = ((i, j - 1), (i, j))
-                    reindex_map[other.bond(*pair)] = pepo.bond(*pair)
-                if j < self.Ly - 1:
-                    pair = ((i, j), (i, j + 1))
-                    reindex_map[other.bond(*pair)] = pepo.bond(*pair)
-
-                t2 = t2.reindex(reindex_map)
-
-            sum_inds = (pepo.upper_ind(*coo), pepo.lower_ind(*coo))
-            t1.direct_product_(t2, sum_inds=sum_inds)
-
-        return pepo
+        return tensor_network_ag_sum(self, other, inplace=inplace)
 
     add_PEPO_ = functools.partialmethod(add_PEPO, inplace=True)
 
-    def __add__(self, other):
-        """PEPO addition."""
-        return self.add_PEPO(other, inplace=False)
-
-    def __iadd__(self, other):
-        """In-place PEPO addition."""
-        return self.add_PEPO(other, inplace=True)
-
-    _apply_peps = tensor_network_apply_op_vec
+    def _apply_peps(
+        self, other, compress=False, contract=True, **compress_opts
+    ):
+        return tensor_network_apply_op_vec(
+            A=self,
+            x=other,
+            compress=compress,
+            contract=contract,
+            **compress_opts,
+        )
 
     def apply(self, other, compress=False, **compress_opts):
         """Act with this PEPO on ``other``, returning a new TN like ``other``

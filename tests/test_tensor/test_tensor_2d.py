@@ -40,7 +40,7 @@ class TestPEPSConstruct:
                 assert isinstance(psi[f"I{i},{j}"], qtn.Tensor)
 
         if Lx == Ly == 3:
-            psi_dense = psi.to_qarray(optimize="random-greedy")
+            psi_dense = psi.to_qarray(optimize="auto-hq")
             assert psi_dense.shape == (512, 1)
 
         psi.show()
@@ -392,7 +392,7 @@ class Test2DContract:
         )
         ex = qu.expec(A, k)
 
-        opts = dict(cutoff=2e-3, max_bond=9, contract_optimize="random-greedy")
+        opts = dict(cutoff=2e-3, max_bond=9, contract_optimize="auto-hq")
         e = peps.compute_local_expectation(
             terms, mode=mode, normalized=normalized, **opts
         )
@@ -417,7 +417,7 @@ class Test2DContract:
             normalized=normalized,
             cutoff=2e-3,
             max_bond=16,
-            contract_optimize="random-greedy",
+            contract_optimize="auto-hq",
         )
 
         # compute 2x1 and 1x2 plaquettes separately
@@ -434,6 +434,49 @@ class Test2DContract:
         e = peps.compute_local_expectation(terms_all, autogroup=False, **opts)
 
         assert e == pytest.approx(ex, rel=1e-2)
+
+    def test_cyclic_basic(self):
+        tn = qtn.TN2D_rand(Lx=3, Ly=4, D=2, cyclic=True)
+        assert tn.is_cyclic_x()
+        assert tn.is_cyclic_y()
+        assert tn.num_indices == 2 * 3 * 4
+        tn = qtn.TN2D_rand(Lx=3, Ly=4, D=2, cyclic=(False, True))
+        assert not tn.is_cyclic_x()
+        assert tn.is_cyclic_y()
+        assert tn.num_indices == 2 * 3 * 4 - 4
+        tn = qtn.TN2D_rand(Lx=3, Ly=4, D=2, cyclic=(True, False))
+        assert tn.is_cyclic_x()
+        assert not tn.is_cyclic_y()
+        assert tn.num_indices == 2 * 3 * 4 - 3
+        tn = qtn.TN2D_rand(Lx=3, Ly=4, D=2, cyclic=(False, False))
+        assert not tn.is_cyclic_x()
+        assert not tn.is_cyclic_y()
+        assert tn.num_indices == 2 * 3 * 4 - 7
+
+    @pytest.mark.parametrize("cyclicx", [False, True])
+    @pytest.mark.parametrize("cyclicy", [False, True])
+    @pytest.mark.parametrize("mode", ["mps", "hotrg", "ctmrg"])
+    def test_cyclic_contract(self, cyclicx, cyclicy, mode):
+        Lx = 5
+        Ly = 6
+        D = 2
+        chi = 3
+        tn = qtn.TN2D_rand(
+            Lx,
+            Ly,
+            D,
+            cyclic=(cyclicx, cyclicy),
+            seed=42,
+            dist="uniform",
+        )
+        Zex = tn.contract(...)
+        if mode == "hotrg":
+            Z = tn.contract_hotrg(chi)
+        elif mode == "ctmrg":
+            Z = tn.contract_ctmrg(chi)
+        else:
+            Z = tn.contract_boundary(chi, mode=mode)
+        assert abs(1 - Z / Zex) < 1e-3
 
 
 class TestPEPO:
@@ -470,7 +513,7 @@ class TestPEPO:
                 assert isinstance(X[f"I{i},{j}"], qtn.Tensor)
 
         if Lx == Ly == 3:
-            X_dense = X.to_qarray(optimize="random-greedy")
+            X_dense = X.to_qarray(optimize="auto-hq")
             assert X_dense.shape == (512, 512)
             assert qu.isherm(X_dense)
 

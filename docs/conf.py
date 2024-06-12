@@ -11,7 +11,7 @@ sys.path.append(os.path.abspath("./_pygments"))
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'quimb'
-copyright = '2015-2023, Johnnie Gray'
+copyright = '2015-2024, Johnnie Gray'
 author = 'Johnnie Gray'
 
 # The full version, including alpha/beta/rc tags
@@ -57,8 +57,8 @@ myst_enable_extensions = [
 autoapi_dirs = ['../quimb']
 
 extlinks = {
-    'issue': ('https://github.com/jcmgray/quimb/issues/%s', 'GH'),
-    'pull': ('https://github.com/jcmgray/quimb/pull/%s', 'PR'),
+    'issue': ('https://github.com/jcmgray/quimb/issues/%s', 'GH %s'),
+    'pull': ('https://github.com/jcmgray/quimb/pull/%s', 'PR %s'),
 }
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3/', None),
@@ -147,7 +147,7 @@ def linkcode_resolve(domain, info):
     if "+" in quimb.__version__:
         return (
             f"https://github.com/jcmgray/quimb/blob/"
-            f"develop/quimb/{fn}{linespec}"
+            f"main/quimb/{fn}{linespec}"
         )
     else:
         return (

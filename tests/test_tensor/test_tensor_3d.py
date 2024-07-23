@@ -5,6 +5,36 @@ import quimb as qu
 import quimb.tensor as qtn
 
 
+class TestTensorNetwork3D:
+    def test_cyclic_basic(self):
+        tn = qtn.TN3D_empty(Lx=3, Ly=4, Lz=5, D=2, cyclic=True)
+        assert tn.is_cyclic_x()
+        assert tn.is_cyclic_y()
+        assert tn.is_cyclic_z()
+        assert tn.num_indices == 3 * tn.nsites
+        tn = qtn.TN3D_empty(Lx=3, Ly=4, Lz=5, D=2, cyclic=(False, False, True))
+        assert not tn.is_cyclic_x()
+        assert not tn.is_cyclic_y()
+        assert tn.is_cyclic_z()
+        assert tn.num_indices == 3 * tn.nsites - (tn.Lx * tn.Lz) - (
+            tn.Ly * tn.Lz
+        )
+        tn = qtn.TN3D_empty(Lx=3, Ly=4, Lz=5, D=2, cyclic=(False, True, False))
+        assert not tn.is_cyclic_x()
+        assert tn.is_cyclic_y()
+        assert not tn.is_cyclic_z()
+        assert tn.num_indices == 3 * tn.nsites - (tn.Lx * tn.Ly) - (
+            tn.Ly * tn.Lz
+        )
+        tn = qtn.TN3D_empty(Lx=3, Ly=4, Lz=5, D=2, cyclic=(True, False, False))
+        assert tn.is_cyclic_x()
+        assert not tn.is_cyclic_y()
+        assert not tn.is_cyclic_z()
+        assert tn.num_indices == 3 * tn.nsites - (tn.Lx * tn.Ly) - (
+            tn.Lx * tn.Lz
+        )
+
+
 class Test3DManualContract:
     @pytest.mark.parametrize("canonize", [False, True])
     def test_contract_boundary_ising_model(self, canonize):
@@ -66,3 +96,25 @@ class Test3DManualContract:
         Z = tn.item() * 10**tn.exponent
         f = -qu.log(Z) / (L**3 * beta)
         assert f == pytest.approx(fex, rel=1e-2)
+
+    @pytest.mark.parametrize("cyclicx", [False, True])
+    @pytest.mark.parametrize("cyclicy", [False, True])
+    @pytest.mark.parametrize("cyclicz", [False, True])
+    @pytest.mark.parametrize("mode", ["hotrg", "ctmrg"])
+    def test_contract_cyclic(self, cyclicx, cyclicy, cyclicz, mode):
+        Lx, Ly, Lz = 3, 4, 5
+        chi = 3
+        tn = qtn.TN3D_from_fill_fn(
+            lambda shape: ar.lazy.Variable(shape=shape, backend="numpy"),
+            Lx,
+            Ly,
+            Lz,
+            D=2,
+            cyclic=(cyclicx, cyclicy, cyclicz),
+        )
+        if mode == "hotrg":
+            lZ = tn.contract_hotrg(max_bond=chi, cutoff=0.0)
+        elif mode == "ctmrg":
+            lZ = tn.contract_ctmrg(max_bond=chi, cutoff=0.0)
+
+        assert lZ.history_max_size() < 2**13

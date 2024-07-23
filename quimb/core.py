@@ -88,10 +88,6 @@ pvectorize = functools.partial(
 target, depending on environment variable 'QUIMB_NUMBA_PARALLEL'.
 """
 
-generated_jit = functools.partial(numba.generated_jit, cache=_NUMBA_CACHE)
-"""Numba generated jit, but obeying cache setting.
-"""
-
 
 class CacheThreadPool(object):
     """ """
@@ -386,7 +382,6 @@ def isreal(qob, **allclose_opts):
 
 
 def allclose_sparse(A, B, **allclose_opts):
-
     if A.shape != B.shape:
         return False
 
@@ -1320,7 +1315,7 @@ def kron(*ops, stype=None, coo_build=False, parallel=False, ownership=None):
         dims = [op.shape[0] for op in ops]
 
         D = prod(dims)
-        if not ((0 <= ri < D) and ((0 < rf <= D))):
+        if not ((0 <= ri < D) and (0 < rf <= D)):
             raise ValueError(f"Ownership ({ri}, {rf}) not in range [0-{D}].")
 
         matching_dyn = tuple(gen_matching_dynal(ri, rf - 1, dims))
@@ -1726,10 +1721,8 @@ def ikron(
         cff_id = 1  # keeps track of compressing adjacent identities
         cff_ov = 1  # keeps track of overlaying op on multiple dimensions
         for ind, dim in enumerate(dims):
-
             # check if op should be placed here
             if ind in inds:
-
                 # check if need preceding identities
                 if cff_id > 1:
                     yield eye(cff_id, **eye_kws)

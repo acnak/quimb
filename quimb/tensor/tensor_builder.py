@@ -1,47 +1,69 @@
-"""Build specific tensor networks, including states and operators.
-"""
-import math
+"""Build specific tensor networks, including states and operators."""
+
+import collections
 import functools
 import itertools
-import collections
+import math
 from numbers import Integral
 
+import autoray as ar
 import numpy as np
-import opt_einsum as oe
 
-from ..core import make_immutable, ikron
-from ..utils import deprecated, unique, concat
+from ..core import ikron, make_immutable
 from ..gen.operators import (
     _gen_mbl_random_factors,
     eye,
     ham_heis,
     spin_operator,
 )
-from ..gen.rand import seed_rand, randn, choice, random_seed_fn, rand_phase
+from ..gen.rand import choice, rand_phase, randn, random_seed_fn, seed_rand
+from ..utils import concat, deprecated, unique
+from .array_ops import asarray, do, reshape, sensibly_scale
+from .contraction import array_contract
+from .decomp import eigh_truncated
+from .tensor_1d import MatrixProductOperator, MatrixProductState
+from .tensor_1d_tebd import LocalHam1D
+from .tensor_2d import TensorNetwork2D, gen_2d_bonds, gen_2d_plaquettes
+from .tensor_2d_tebd import LocalHam2D
+from .tensor_3d import TensorNetwork3D, gen_3d_bonds, gen_3d_plaquettes
+from .tensor_3d_tebd import LocalHam3D
+from .tensor_arbgeom import (
+    TensorNetworkGen,
+    TensorNetworkGenOperator,
+    TensorNetworkGenVector,
+)
 from .tensor_core import (
-    new_bond,
-    rand_uuid,
-    tensor_direct_product,
+    COPY_tensor,
     Tensor,
     TensorNetwork,
+    new_bond,
+    rand_uuid,
+    tags_to_oset,
+    tensor_direct_product,
+    tensor_network_sum,
 )
-from .array_ops import asarray, sensibly_scale, reshape, do
-from .decomp import eigh
-from .tensor_arbgeom import TensorNetworkGen, TensorNetworkGenVector
-from .tensor_1d import MatrixProductState, MatrixProductOperator
-from .tensor_2d import gen_2d_bonds, gen_2d_plaquettes, TensorNetwork2D
-from .tensor_3d import gen_3d_bonds, gen_3d_plaquettes, TensorNetwork3D
-from .tensor_1d_tebd import LocalHam1D
-from .tensor_2d_tebd import LocalHam2D
-from .tensor_3d_tebd import LocalHam3D
 
 
 @functools.lru_cache(maxsize=64)
 def delta_array(shape, dtype="float64"):
+    """Get the delta symbol AKA COPY-tensor as an ndarray.
+
+    Parameters
+    ----------
+    shape : tuple[int]
+        The shape of the array, not all dimensions have to match.
+    dtype : str, optional
+        The data type of the array.
+
+    Returns
+    -------
+    numpy.ndarray
+    """
     x = np.zeros(shape, dtype=dtype)
     idx = np.indices(x.shape)
     # 1 where all indices are equal
     x[(idx[0] == idx).all(axis=0)] = 1
+    make_immutable(x)
     return x
 
 
@@ -52,17 +74,47 @@ def get_rand_fill_fn(
     seed=None,
     dtype="float64",
 ):
+    """Get a callable with the given random distribution and parameters, that
+    has signature ``fill_fn(shape) -> array``.
+
+    Parameters
+    ----------
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
+    loc : float, optional
+        An additive offset to add to the random numbers.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
+    seed : int, optional
+        A random seed.
+    dtype : {'float64', 'complex128', 'float32', 'complex64'}, optional
+        The underlying data type.
+
+    Returns
+    -------
+    callable
+    """
     if seed is not None:
         seed_rand(seed)
 
-    def fill_fn(shape):
+    def fill_fn(shape=()):
         return randn(shape, dtype=dtype, dist=dist, loc=loc, scale=scale)
 
     return fill_fn
 
 
 @random_seed_fn
-def rand_tensor(shape, inds, tags=None, dtype="float64", left_inds=None):
+def rand_tensor(
+    shape,
+    inds,
+    tags=None,
+    dtype="float64",
+    dist="normal",
+    scale=1.0,
+    loc=0.0,
+    left_inds=None,
+    **randn_opts,
+):
     """Generate a random tensor with specified shape and inds.
 
     Parameters
@@ -75,6 +127,12 @@ def rand_tensor(shape, inds, tags=None, dtype="float64", left_inds=None):
         Labels to tag this tensor with.
     dtype : {'float64', 'complex128', 'float32', 'complex64'}, optional
         The underlying data type.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
+    loc : float, optional
+        An additive offset to add to the random numbers.
     left_inds : sequence of str, optional
         Which, if any, indices to group as 'left' indices of an effective
         matrix. This can be useful, for example, when automatically applying
@@ -85,7 +143,9 @@ def rand_tensor(shape, inds, tags=None, dtype="float64", left_inds=None):
     -------
     Tensor
     """
-    data = randn(shape, dtype=dtype)
+    data = randn(
+        shape, dtype=dtype, dist=dist, scale=scale, loc=loc, **randn_opts
+    )
     return Tensor(data=data, inds=inds, tags=tags, left_inds=left_inds)
 
 
@@ -111,6 +171,93 @@ def rand_phased(shape, inds, tags=None, dtype=complex):
     Tensor
     """
     data = rand_phase(shape, dtype=dtype)
+    return Tensor(data=data, inds=inds, tags=tags)
+
+
+def rand_symmetric_array(
+    d,
+    ndim,
+    dist="normal",
+    loc=0.0,
+    scale=1.0,
+    seed=None,
+    dtype="float64",
+    fill_fn=None,
+):
+    """Get a random symmetric array, i.e. one that is invariant under
+    permutation of its indices. It has `(ndim + d - 1) choose (d - 1)` unique
+    elements.
+
+    Parameters
+    ----------
+    d : int
+        The size of each dimension.
+    ndim : int
+        The number of dimensions.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
+    loc : float, optional
+        An additive offset to add to the random numbers.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
+    seed : int, optional
+        A random seed.
+    dtype : {'float64', 'complex128', 'float32', 'complex64'}, optional
+        The underlying data type.
+    fill_fn : callable, optional
+        A function that takes a shape (here always `()`) and returns an array,
+        rather that using the random number generator.
+
+    Returns
+    -------
+    numpy.ndarray
+    """
+    if fill_fn is None:
+        fill_fn = get_rand_fill_fn(
+            dist=dist, loc=loc, scale=scale, seed=seed, dtype=dtype
+        )
+
+    value_store = collections.defaultdict(fill_fn)
+    x = np.empty((d,) * ndim, dtype=np.float64)
+    for coo in itertools.product(range(d), repeat=ndim):
+        key = [0] * d
+        for i in coo:
+            key[i] += 1
+        key = tuple(key)
+        x[coo] = value_store[key]
+    return x
+
+
+def rand_tensor_symmetric(
+    d, inds, tags=None, dist="normal", loc=0.0, scale=1.0, seed=None
+):
+    """Generate a random symmetric tensor with specified local dimension and
+    inds.
+
+    Parameters
+    ----------
+    d : int
+        Size of each dimension.
+    inds : sequence of str
+        Names of each dimension.
+    tags : sequence of str
+        Labels to tag this tensor with.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
+    loc : float, optional
+        An additive offset to add to the random numbers.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
+    seed : int, optional
+        A random seed.
+
+    Returns
+    -------
+    Tensor
+    """
+    data = rand_symmetric_array(
+        d, len(inds), dist=dist, loc=loc, scale=scale, seed=seed
+    )
     return Tensor(data=data, inds=inds, tags=tags)
 
 
@@ -243,12 +390,16 @@ def TN_from_edges_and_fill_fn(
         at each node.
     site_tag_id : str, optional
         String with formatter to tag sites.
-    site_ind_id : str, optional
-        String with formatter to tag indices (if ``phys_dim`` specified).
+    site_ind_id : str or (str, str), optional
+        String with formatter to tag indices (if ``phys_dim`` specified). If a
+        single str is supplied, the tensor network will have a single index at
+        each site, representing a vector. If a pair of strings is supplied, the
+        tensor network will have two indices at each site, representing an
+        operator with upper and lower indices.
 
     Returns
     -------
-    TensorNetworkGen or TensorNetworkGenVector
+    TensorNetworkGen, TensorNetworkGenVector or TensorNetworkGenOperator
     """
     terms = collections.defaultdict(list)
     bonds = collections.defaultdict(rand_uuid)
@@ -259,26 +410,51 @@ def TN_from_edges_and_fill_fn(
         terms[node_a].insert(0, bond)
         terms[node_b].insert(0, bond)
 
+    if phys_dim is not None:
+        if isinstance(site_ind_id, str):
+            qtype = "vector"
+        else:
+            qtype = "operator"
+            upper_ind_id, lower_ind_id = site_ind_id
+    else:
+        qtype = "scalar"
+
     ts = []
     sites = []
     for node, inds in sorted(terms.items(), key=lambda x: x[0]):
         sites.append(node)
         shape = [D] * len(inds)
-        if phys_dim is not None:
+
+        # check if not scalar tensor
+        if qtype == "vector":
             inds.append(site_ind_id.format(node))
             shape.append(phys_dim)
+        elif qtype == "operator":
+            inds.append(upper_ind_id.format(node))
+            inds.append(lower_ind_id.format(node))
+            shape.append(phys_dim)
+            shape.append(phys_dim)
+
         data = fill_fn(shape)
         tags = site_tag_id.format(node)
         ts.append(Tensor(data=data, inds=inds, tags=tags))
 
     tn = TensorNetwork(ts)
 
-    if phys_dim is not None:
+    if qtype == "vector":
         tn.view_as_(
             TensorNetworkGenVector,
             sites=sites,
             site_tag_id=site_tag_id,
             site_ind_id=site_ind_id,
+        )
+    elif qtype == "operator":
+        tn.view_as_(
+            TensorNetworkGenOperator,
+            sites=sites,
+            site_tag_id=site_tag_id,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
         )
     else:
         tn.view_as_(TensorNetworkGen, sites=sites, site_tag_id=site_tag_id)
@@ -317,7 +493,7 @@ def TN_from_edges_empty(
 
     Returns
     -------
-    TensorNetworkGen or TensorNetworkGenVector
+    TensorNetworkGen, TensorNetworkGenVector or TensorNetworkGenOperator
     """
 
     def fill_fn(shape):
@@ -368,7 +544,7 @@ def TN_from_edges_with_value(
 
     Returns
     -------
-    TensorNetworkGen or TensorNetworkGenVector
+    TensorNetworkGen, TensorNetworkGenVector or TensorNetworkGenOperator
     """
     element = np.array(value, dtype=dtype)
 
@@ -393,6 +569,7 @@ def TN_from_edges_rand(
     dtype="float64",
     site_tag_id="I{}",
     site_ind_id="k{}",
+    **randn_opts,
 ):
     """Create a random tensor network with geometry defined from a sequence
     of edges defining a graph.
@@ -409,42 +586,33 @@ def TN_from_edges_rand(
         to mimic a wavefunction of ``len(G)`` sites.
     seed : int, optional
         A random seed.
+    dtype : str, optional
+        The data type of the tensors.
     site_tag_id : str, optional
         String with formatter to tag sites.
     site_ind_id : str, optional
         String with formatter to tag indices (if ``phys_dim`` specified).
+    randn_opts
+        Supplied to :func:`~quimb.gen.rand.randn`.
 
     Returns
     -------
-    TensorNetworkGen or TensorNetworkGenVector
+    TensorNetworkGen, TensorNetworkGenVector or TensorNetworkGenOperator
     """
-    ts = {}
+    if seed is not None:
+        seed_rand(seed)
 
-    sites = tuple(sorted(set(concat(edges))))
+    def fill_fn(shape):
+        return randn(shape, dtype=dtype, **randn_opts)
 
-    for node in sites:
-        t = Tensor(tags=site_tag_id.format(node))
-        if phys_dim is not None:
-            t.new_ind(site_ind_id.format(node), size=phys_dim)
-        ts[node] = t
-
-    for node_a, node_b in gen_unique_edges(edges):
-        new_bond(ts[node_a], ts[node_b], size=D)
-
-    tn = TensorNetwork(ts.values())
-    tn.randomize_(seed=seed, dtype=dtype)
-
-    if phys_dim is not None:
-        tn.view_as_(
-            TensorNetworkGenVector,
-            sites=sites,
-            site_tag_id=site_tag_id,
-            site_ind_id=site_ind_id,
-        )
-    else:
-        tn.view_as_(TensorNetworkGen, sites=sites, site_tag_id=site_tag_id)
-
-    return tn
+    return TN_from_edges_and_fill_fn(
+        fill_fn=fill_fn,
+        edges=edges,
+        D=D,
+        phys_dim=phys_dim,
+        site_tag_id=site_tag_id,
+        site_ind_id=site_ind_id,
+    )
 
 
 TN_rand_from_edges = deprecated(
@@ -461,6 +629,7 @@ def TN_rand_reg(
     dtype="float64",
     site_tag_id="I{}",
     site_ind_id="k{}",
+    **randn_opts,
 ):
     """Create a random regular tensor network.
 
@@ -485,7 +654,7 @@ def TN_rand_reg(
 
     Returns
     -------
-    TensorNetworkGen or TensorNetworkGenVector
+    TensorNetworkGen, TensorNetworkGenVector or TensorNetworkGenOperator
     """
     import networkx as nx
 
@@ -498,6 +667,54 @@ def TN_rand_reg(
         dtype=dtype,
         site_tag_id=site_tag_id,
         site_ind_id=site_ind_id,
+        **randn_opts,
+    )
+
+
+def TN_rand_tree(
+    n,
+    D,
+    phys_dim=None,
+    seed=None,
+    dtype="float64",
+    site_tag_id="I{}",
+    site_ind_id="k{}",
+    **randn_opts,
+):
+    """Create a random tree tensor network.
+
+    Parameters
+    ----------
+    n : int
+        The number of tensors.
+    D : int
+        The bond dimension connecting tensors.
+    phys_dim : int, optional
+        If not ``None``, give each tensor a 'physical', free index of this size
+        to mimic a wavefunction of ``n`` sites.
+    seed : int, optional
+        A random seed.
+    site_tag_id : str, optional
+        String with formatter to tag sites.
+    site_ind_id : str, optional
+        String with formatter to tag indices (if ``phys_dim`` specified).
+
+    Returns
+    -------
+    TensorNetworkGen, TensorNetworkGenVector or TensorNetworkGenOperator
+    """
+    import networkx as nx
+
+    G = nx.random_tree(n, seed=seed)
+    return TN_from_edges_rand(
+        G.edges,
+        D=D,
+        phys_dim=phys_dim,
+        seed=seed,
+        dtype=dtype,
+        site_tag_id=site_tag_id,
+        site_ind_id=site_ind_id,
+        **randn_opts,
     )
 
 
@@ -670,7 +887,7 @@ def HTN_CP_from_inds_and_fill_fn(
         If given, a specific name for the inner hyper index.
     """
 
-    tn = TensorNetwork([])
+    tn = TensorNetwork()
 
     if tags is None:
         tags = [None] * len(inds)
@@ -697,7 +914,7 @@ def HTN_CP_from_sites_and_fill_fn(
     site_ind_id="k{}",
     bond_ind=None,
 ):
-    """Create a CP-decomposition structured hyper tensor network from a
+    """Create a CP-decomposition structured hyper tensor network state from a
     sequence of sites and a fill function.
 
     Parameters
@@ -737,6 +954,80 @@ def HTN_CP_from_sites_and_fill_fn(
         site_tag_id=site_tag_id,
         site_ind_id=site_ind_id,
     )
+
+
+def HTN_CP_operator_from_products(
+    array_seqs,
+    upper_inds,
+    lower_inds,
+    tags_each=None,
+    tags_all=None,
+    bond_ind=None,
+):
+    r"""Construct a CP form hyper tensor network of the sum of matrix strings:
+
+    .. math::
+
+        \sum_i A_i B_i C_i \ldots
+
+    using a single hyper index to enumerate each sequence of operators.
+
+    Parameters
+    ----------
+    array_seqs : sequence[arrays_like]
+        The arrays to use in each product, each of which should be 2D.
+    upper_inds : sequence[sequence[str]]
+        The upper indices to use for each array in each product.
+    lower_inds : sequence[sequence[str]]
+        The lower indices to use for each array in each product.
+    tags_each : sequence[sequence[str]], optional
+        The tags to use for each array in each product.
+    tags_all : sequence[str], optional
+        The tags to use for the whole hyper tensor network.
+    bond_ind : str, optional
+        The name of the hyper index to use, by default randomly generated.
+
+    Returns
+    -------
+    htn : TensorNetwork
+    """
+
+    # make sure both are tuple[tuple[str]]
+    upper_inds = tuple(
+        (lix,) if isinstance(lix, str) else lix for lix in upper_inds
+    )
+    lower_inds = tuple(
+        (lix,) if isinstance(lix, str) else lix for lix in lower_inds
+    )
+
+    # default values
+    if tags_each is None:
+        tags_each = [None] * len(upper_inds)
+    if bond_ind is None:
+        bond_ind = rand_uuid()
+
+    # construct the product TNs each with hyper bond D=1
+    tns = []
+    for arrays in array_seqs:
+        tn = TensorNetwork()
+        for array, uix, lix, tgs in zip(
+            arrays, upper_inds, lower_inds, tags_each
+        ):
+            tn |= Tensor(
+                data=array.reshape((1, *array.shape)),
+                inds=(bond_ind, *uix, *lix),
+                tags=tgs,
+            )
+        tns.append(tn)
+
+    # sum them into single HTN with D > 1
+    tn = functools.reduce(tensor_network_sum, tns)
+
+    # add global tags
+    for tag in tags_to_oset(tags_all):
+        tn.add_tag(tag)
+
+    return tn
 
 
 def HTN_dual_from_edges_and_fill_fn(
@@ -802,6 +1093,7 @@ def convert_to_2d(
     functions that only require a list of edges etc.
     """
     import itertools
+
     from quimb.tensor.tensor_2d import TensorNetwork2D
 
     tn2d = tn if inplace else tn.copy()
@@ -1056,12 +1348,12 @@ def TN2D_rand(
         String specifier for naming convention of row tags.
     y_tag_id : str, optional
         String specifier for naming convention of column tags.
-    dist : str, optional
-        The distribution to sample from.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
     loc : float, optional
-        The 'location' of the distribution, its meaning depends on ``dist``.
+        An additive offset to add to the random numbers.
     scale : float, optional
-        The 'scale' of the distribution, its meaning depends on ``dist``.
+        A multiplicative factor to scale the random numbers by.
     seed : int, optional
         A random seed.
     dtype : dtype, optional
@@ -1072,6 +1364,76 @@ def TN2D_rand(
     TensorNetwork2D
     """
     fill_fn = get_rand_fill_fn(dist, loc, scale, seed, dtype)
+
+    return TN2D_from_fill_fn(
+        fill_fn,
+        Lx=Lx,
+        Ly=Ly,
+        D=D,
+        cyclic=cyclic,
+        site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id,
+        y_tag_id=y_tag_id,
+    )
+
+
+def TN2D_rand_symmetric(
+    Lx,
+    Ly,
+    D,
+    cyclic=False,
+    site_tag_id="I{},{}",
+    x_tag_id="X{}",
+    y_tag_id="Y{}",
+    dist="normal",
+    loc=0,
+    scale=1,
+    seed=None,
+    dtype="float64",
+):
+    """Create a random 2D lattice tensor network where every tensor is
+    symmetric up to index permutations.
+
+    Parameters
+    ----------
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool), optional
+        Whether to use periodic boundary conditions. X and Y can be specified
+        separately using a tuple.
+    site_tag_id : str, optional
+        String specifier for naming convention of site tags.
+    x_tag_id : str, optional
+        String specifier for naming convention of row tags.
+    y_tag_id : str, optional
+        String specifier for naming convention of column tags.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
+    loc : float, optional
+        An additive offset to add to the random numbers.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
+    seed : int, optional
+        A random seed.
+    dtype : dtype, optional
+        Data type of the random arrays.
+
+    Returns
+    -------
+    TensorNetwork2D
+    """
+    entry_fill_fn = get_rand_fill_fn(
+        dist=dist, loc=loc, scale=scale, seed=seed, dtype=dtype
+    )
+
+    def fill_fn(shape):
+        (d,) = set(shape)
+        ndim = len(shape)
+        return rand_symmetric_array(d, ndim, fill_fn=entry_fill_fn)
 
     return TN2D_from_fill_fn(
         fill_fn,
@@ -1168,6 +1530,8 @@ def TN2D_corner_double_line(
 def TN2D_rand_hidden_loop(
     Lx,
     Ly,
+    *,
+    cyclic=False,
     line_dim=2,
     line_density=2,
     seed=None,
@@ -1183,7 +1547,7 @@ def TN2D_rand_hidden_loop(
 ):
     fill_fn = get_rand_fill_fn(dist, loc, scale, seed, dtype)
 
-    edges = tuple(gen_2d_bonds(Lx, Ly)) * line_density
+    edges = tuple(gen_2d_bonds(Lx, Ly, cyclic=cyclic)) * line_density
 
     kwargs.setdefault("join", True)
     kwargs.setdefault("random_rewire", True)
@@ -1221,6 +1585,7 @@ def convert_to_3d(
     functions that only require a list of edges etc.
     """
     import itertools
+
     from quimb.tensor.tensor_3d import TensorNetwork3D
 
     tn3d = tn if inplace else tn.copy()
@@ -1566,6 +1931,8 @@ def TN3D_rand_hidden_loop(
     Lx,
     Ly,
     Lz,
+    *,
+    cyclic=False,
     line_dim=2,
     line_density=2,
     seed=None,
@@ -1582,7 +1949,7 @@ def TN3D_rand_hidden_loop(
 ):
     fill_fn = get_rand_fill_fn(dist, loc, scale, seed, dtype)
 
-    edges = tuple(gen_3d_bonds(Lx, Ly, Lz)) * line_density
+    edges = tuple(gen_3d_bonds(Lx, Ly, Lz, cyclic=cyclic)) * line_density
 
     kwargs.setdefault("join", True)
     kwargs.setdefault("random_rewire", True)
@@ -1637,7 +2004,7 @@ def classical_ising_sqrtS_matrix(beta, j=1.0, asymm=None):
     network.
     """
     if (j < 0.0) and (asymm is not None):
-        Slr = eigh(classical_ising_S_matrix(beta=beta, j=j))
+        Slr = eigh_truncated(classical_ising_S_matrix(beta=beta, j=j))
         S_1_2 = {
             "l": Slr[0],
             "lT": Slr[0].T,
@@ -1674,6 +2041,7 @@ def classical_ising_T_matrix(
     j=1.0,
     h=0.0,
     directions="lrud",
+    output=False,
     asymm=None,
 ):
     """The single effective TN site for the classical ising model."""
@@ -1690,10 +2058,14 @@ def classical_ising_T_matrix(
     arrays = [
         classical_ising_sqrtS_matrix(beta=beta, j=j, asymm=a)
         for j, a in zip(js, asymms)
-    ] + [classical_ising_H_matrix(beta, h)]
-    lhs = ",".join(f"i{x}" for x in directions)
-    eq = lhs + ",i->" + directions
-    return oe.contract(eq, *arrays)
+    ] + [classical_ising_H_matrix(beta, float(h))]
+
+    inputs = (*(("i", x) for x in directions), ("i",))
+    out = tuple(directions)
+    if output:
+        out = out + ("i",)
+
+    return array_contract(arrays, inputs, out)
 
 
 def HTN2D_classical_ising_partition_function(
@@ -1721,8 +2093,10 @@ def HTN2D_classical_ising_partition_function(
         The inverse temperature.
     h : float, optional
         The magnetic field strength.
-    j : float, optional
-        The interaction strength, positive being *ferromagnetic*.
+    j : float, dict, or callable, optional
+        The interaction strength, positive being *ferromagnetic*. If a dict
+        should contain entries for each edge, keyed by the edge. If a callable
+        should have the signature ``j(node_a, node_b)`` and return a float.
     cyclic : bool or (bool, bool), optional
         Whether to use periodic boundary conditions. X and Y can be specified
         separately using a tuple.
@@ -1745,6 +2119,10 @@ def HTN2D_classical_ising_partition_function(
 
     if callable(j):
         j_factory = j
+    elif isinstance(j, dict):
+
+        def j_factory(node_a, node_b):
+            return j[node_a, node_b]
     else:
 
         def j_factory(node_a, node_b):
@@ -1769,10 +2147,32 @@ def HTN2D_classical_ising_partition_function(
             ts.append(Tensor(data, inds=inds))
 
         if h != 0.0:
-            data = classical_ising_H_matrix(beta=beta, h=h)
+            data = classical_ising_H_matrix(beta=beta, h=float(h))
             ts.append(Tensor(data, inds=(ind_id.format(ni, nj),)))
 
     return TensorNetwork(ts)
+
+
+def parse_j_coupling_to_function(j):
+    """Parse the ``j`` argument to a function that can be called to get the
+    coupling strength between two nodes. The input can be a constant, dict or
+    function.
+    """
+    if callable(j):
+        return j
+
+    elif isinstance(j, dict):
+
+        def j_factory(node_a, node_b):
+            return j[node_a, node_b]
+
+        return j_factory
+    else:
+
+        def j_factory(node_a, node_b):
+            return j
+
+        return j_factory
 
 
 def HTN3D_classical_ising_partition_function(
@@ -1801,8 +2201,10 @@ def HTN3D_classical_ising_partition_function(
         Length of side z.
     beta : float
         The inverse temperature.
-    j : float, optional
-        The interaction strength, positive being *ferromagnetic*.
+    j : float, dict, or callable, optional
+        The interaction strength, positive being *ferromagnetic*. If a dict
+        should contain entries for each edge, keyed by the edge. If a callable
+        should have the signature ``j(node_a, node_b)`` and return a float.
     h : float, optional
         The magnetic field strength.
     cyclic : bool or (bool, bool, bool), optional
@@ -1825,12 +2227,7 @@ def HTN3D_classical_ising_partition_function(
     except TypeError:
         cyclic_x = cyclic_y = cyclic_z = cyclic
 
-    if callable(j):
-        j_factory = j
-    else:
-
-        def j_factory(node_a, node_b):
-            return j
+    j_factory = parse_j_coupling_to_function(j)
 
     ts = []
     for ni, nj, nk in itertools.product(range(Lx), range(Ly), range(Lz)):
@@ -1859,7 +2256,7 @@ def HTN3D_classical_ising_partition_function(
             ts.append(Tensor(data, inds=inds))
 
         if h != 0.0:
-            data = classical_ising_H_matrix(beta=beta, h=h)
+            data = classical_ising_H_matrix(beta=beta, h=float(h))
             ts.append(Tensor(data, inds=(ind_id.format(ni, nj, nk),)))
 
     return TensorNetwork(ts)
@@ -1875,6 +2272,8 @@ def TN2D_classical_ising_partition_function(
     site_tag_id="I{},{}",
     x_tag_id="X{}",
     y_tag_id="Y{}",
+    outputs=(),
+    ind_id="s{},{}",
 ):
     """The tensor network representation of the 2D classical ising model
     partition function.
@@ -1887,8 +2286,10 @@ def TN2D_classical_ising_partition_function(
         Length of side y.
     beta : float
         The inverse temperature.
-    j : float, optional
-        The interaction strength, positive being *ferromagnetic*.
+    j : float, dict, or callable, optional
+        The interaction strength, positive being *ferromagnetic*. If a dict
+        should contain entries for each edge, keyed by the edge. If a callable
+        should have the signature ``j(node_a, node_b)`` and return a float.
     h : float, optional
         The magnetic field strength.
     cyclic : bool or (bool, bool), optional
@@ -1900,6 +2301,12 @@ def TN2D_classical_ising_partition_function(
         String specifier for naming convention of row tags.
     y_tag_id : str, optional
         String specifier for naming convention of column tags.
+    outputs : sequence of tuple[int, int], optional
+        Which sites to generate output indices (i.e. dangling legs) for.
+        The index is named according to ``ind_id``.
+    ind_id : str, optional
+        How to label the indices i.e. ``ind_id.format(i, j)``, each of
+        which corresponds to a single classical spin in ``outputs``.
 
     Returns
     -------
@@ -1914,12 +2321,13 @@ def TN2D_classical_ising_partition_function(
     except TypeError:
         cyclic_x = cyclic_y = cyclic
 
-    if callable(j):
-        j_factory = j
-    else:
+    j_factory = parse_j_coupling_to_function(j)
 
-        def j_factory(node_a, node_b):
-            return j
+    if outputs:
+        if isinstance(outputs[0], int):
+            # single output
+            outputs = (outputs,)
+        outputs = set(outputs)
 
     ts = []
     bonds = collections.defaultdict(rand_uuid)
@@ -1945,14 +2353,19 @@ def TN2D_classical_ising_partition_function(
                 asymms += ("l" if pair not in bonds else "rT",)
                 inds.append(bonds[pair])
 
+        site_is_output = (ni, nj) in outputs
+        if site_is_output:
+            inds.append(ind_id.format(ni, nj))
+
         ts.append(
             Tensor(
                 data=classical_ising_T_matrix(
                     beta=beta,
                     directions=directions,
                     j=js,
-                    h=h,
+                    h=float(h),
                     asymm=asymms,
+                    output=site_is_output,
                 ),
                 inds=inds,
                 tags=[
@@ -1987,6 +2400,8 @@ def TN3D_classical_ising_partition_function(
     x_tag_id="X{}",
     y_tag_id="Y{}",
     z_tag_id="Z{}",
+    outputs=(),
+    ind_id="s{},{},{}",
 ):
     """Tensor network representation of the 3D classical ising model
     partition function.
@@ -2001,8 +2416,10 @@ def TN3D_classical_ising_partition_function(
         Length of side z.
     beta : float
         The inverse temperature.
-    j : float, optional
-        The interaction strength, positive being *ferromagnetic*.
+    j : float, dict, or callable, optional
+        The interaction strength, positive being *ferromagnetic*. If a dict
+        should contain entries for each edge, keyed by the edge. If a callable
+        should have the signature ``j(node_a, node_b)`` and return a float.
     h : float, optional
         The magnetic field strength.
     cyclic : bool or (bool, bool, bool), optional
@@ -2010,6 +2427,18 @@ def TN3D_classical_ising_partition_function(
         specified separately using a tuple.
     site_tag_id : str, optional
         String formatter specifying how to label each site.
+    x_tag_id : str, optional
+        String formatter specifying how to label each x-plane.
+    y_tag_id : str, optional
+        String formatter specifying how to label each y-plane.
+    z_tag_id : str, optional
+        String formatter specifying how to label each z-plane.
+    outputs : sequence of tuple[int, int, int], optional
+        Which sites to generate output indices (i.e. dangling legs) for.
+        The index is named according to ``ind_id``.
+    ind_id : str, optional
+        How to label the indices i.e. ``ind_id.format(i, j, k)``, each of
+        which corresponds to a single classical spin in ``outputs``.
 
     Returns
     -------
@@ -2024,12 +2453,13 @@ def TN3D_classical_ising_partition_function(
     except TypeError:
         cyclic_x = cyclic_y = cyclic_z = cyclic
 
-    if callable(j):
-        j_factory = j
-    else:
+    j_factory = parse_j_coupling_to_function(j)
 
-        def j_factory(node_a, node_b):
-            return j
+    if outputs:
+        if isinstance(outputs[0], int):
+            # single output
+            outputs = (outputs,)
+        outputs = set(outputs)
 
     ts = []
     bonds = collections.defaultdict(rand_uuid)
@@ -2069,14 +2499,19 @@ def TN3D_classical_ising_partition_function(
                 asymms += ("l" if pair not in bonds else "rT",)
                 inds.append(bonds[pair])
 
+        site_is_output = (ni, nj, nk) in outputs
+        if site_is_output:
+            inds.append(ind_id.format(ni, nj, nk))
+
         ts.append(
             Tensor(
                 data=classical_ising_T_matrix(
                     beta=beta,
                     directions=directions,
                     j=js,
-                    h=h,
+                    h=float(h),
                     asymm=asymms,
+                    output=site_is_output,
                 ),
                 inds=inds,
                 tags=[
@@ -2124,10 +2559,10 @@ def HTN_classical_partition_function_from_edges(
         ``(u, v)`` and ``(v, u)`` and only one edge will be added.
     beta : float, optional
         The inverse temperature.
-    j : float, or callable, optional
-        The interaction strength, positive being *ferromagnetic*. If a
-        callable should have the signature ``j(node_a, node_b)`` and return
-        a float.
+    j : float, dict, or callable, optional
+        The interaction strength, positive being *ferromagnetic*. If a dict
+        should contain entries for each edge, keyed by the edge. If a callable
+        should have the signature ``j(node_a, node_b)`` and return a float.
     h : float, or callable, optional
         The magnetic field strength. If a callable should have the
         signature ``h(node)`` and return a float.
@@ -2145,12 +2580,7 @@ def HTN_classical_partition_function_from_edges(
     -------
     TensorNetwork
     """
-    if callable(j):
-        j_factory = j
-    else:
-
-        def j_factory(node_a, node_b):
-            return j
+    j_factory = parse_j_coupling_to_function(j)
 
     ts = []
     for node_a, node_b in gen_unique_edges(edges):
@@ -2172,7 +2602,7 @@ def HTN_classical_partition_function_from_edges(
                 return h
 
         for node in unique(concat(edges)):
-            data = classical_ising_H_matrix(beta, h=h_factory(node))
+            data = classical_ising_H_matrix(beta, h=float(h_factory(node)))
             inds = [site_ind_id.format(node)]
             tags = [site_tag_id.format(node)]
             ts.append(Tensor(data=data, inds=inds, tags=tags))
@@ -2200,10 +2630,10 @@ def TN_classical_partition_function_from_edges(
         ``(u, v)`` and ``(v, u)`` and only one edge will be added.
     beta : float, optional
         The inverse temperature.
-    j : float, or callable, optional
-        The interaction strength, positive being *ferromagnetic*. If a
-        callable should have the signature ``j(node_a, node_b)`` and return
-        a float.
+    j : float, dict, or callable, optional
+        The interaction strength, positive being *ferromagnetic*. If a dict
+        should contain entries for each edge, keyed by the edge. If a callable
+        should have the signature ``j(node_a, node_b)`` and return a float.
     h : float, or callable, optional
         The magnetic field strength. If a callable should have the
         signature ``h(node)`` and return a float.
@@ -2218,12 +2648,7 @@ def TN_classical_partition_function_from_edges(
     -------
     TensorNetwork
     """
-    if callable(j):
-        j_factory = j
-    else:
-
-        def j_factory(node_a, node_b):
-            return j
+    j_factory = parse_j_coupling_to_function(j)
 
     to_contract = collections.defaultdict(list)
     ts = []
@@ -2257,7 +2682,7 @@ def TN_classical_partition_function_from_edges(
                 return h
 
         for node in sites:
-            data = classical_ising_H_matrix(beta, h=h_factory(node))
+            data = classical_ising_H_matrix(beta, h=float(h_factory(node)))
             inds = [f"s{node}"]
             tags = [site_tag_id.format(node)]
             ts.append(Tensor(data=data, inds=inds, tags=tags))
@@ -2269,6 +2694,304 @@ def TN_classical_partition_function_from_edges(
         tn.contract_ind(ind, output_inds=output_inds)
 
     tn.view_as_(TensorNetworkGen, sites=sites, site_tag_id=site_tag_id)
+    return tn
+
+
+def make_couplings_matrix_symmetric(J, UPLO="auto"):
+    """Take a coupling matrix or dict of pairwise strengths in either upper or
+    lower triangular form and return a symmetric matrix.
+
+    Parameters
+    ----------
+    J : array_like or dict[(int, int), float]
+        The couplings, as a square matrix or explicit dict. If a matrix, the
+        upper or lower triangle (corresponding to ``UPLO``) should the pairwise
+        interaction strengths. If a dict, then each non-zero interaction can be
+        specified explicitly.
+    UPLO : {"auto", "L", "U"}, optional
+        Whether to read the couplings in from ``J`` in lower ('L': ``i >= j``)
+        or upper ('U': ``i <= j``) form. If ``J`` is a dict then this only
+        matters if both are present and in that case acts as a preference.
+        If ``"auto"`` then either the lower or upper, or symmetric distances
+        can be supplied, but an error is raised if both are.
+
+    Returns
+    -------
+    J : array_like
+        The couplings as a symmetric matrix.
+    """
+    if isinstance(J, dict):
+        N = max(ij for coo in J for ij in coo) + 1
+        X = np.zeros((N, N))
+        haslower = hasupper = False
+        for (i, j), xij in J.items():
+            X[i, j] = xij
+
+    else:
+        #  assumed array supplied
+        N = ar.shape(J)[0]
+        X = J.copy()
+
+    if UPLO == "auto":
+        symm = np.allclose(X, X.T)
+        hasupper = np.any(X[np.triu_indices(N)])
+        haslower = np.any(X[np.tril_indices(N)])
+
+        if symm:
+            UPLO = "L"
+        else:
+            if hasupper and haslower:
+                raise ValueError(
+                    "Both upper (i < j) and lower (i > j) distances supplied "
+                    "but they are not symmetric. Supply one, or set UPLO='L' "
+                    "or 'U' to specify which to prefer."
+                )
+            UPLO = "U" if hasupper else "L"
+
+    # erase other triangle
+    if UPLO == "L":
+        X[np.triu_indices(N)] = 0.0
+    else:
+        X[np.tril_indices(N)] = 0.0
+
+    # make symmetric
+    X += X.T
+
+    return X
+
+
+def TN2D_embedded_classical_ising_partition_function(
+    Jij,
+    beta,
+    outputs=(),
+    ordering=None,
+    sites_location="side",
+    UPLO="auto",
+    contract_sites=True,
+    site_tag_id="I{},{}",
+    x_tag_id="X{}",
+    y_tag_id="Y{}",
+    ind_id="s{}",
+):
+    """Construct a (triangular) '2D' tensor network representation of the
+    classical ising model partition function with all-to-all interactions, by
+    embedding it in a 2D lattice. For `N` spins this will have `N(N-1)/2`
+    tensors, present at sites `(i, j)` where `i > j`. If `outputs` is supplied,
+    then dangling indices will be added for each output, to give a 'standard'
+    TN representation of the unnormalized marginal distribution over those
+    outputs. Since each spin is effectively "delocalized" into a COPY-tensor
+    MPS spanning the lattice, there is a choice of where to put the outputs,
+    specified by `sites_location`.
+
+    ``sites_location="side"``::
+
+        ...   .  .  .  ╭──
+                       │
+        j=2   .  .  ╭──O──...
+                    │  │
+        j=1   .  ╭──O──O──...
+                 │  │  │
+        j=0   ╭──O──O──O──...
+              │  │  │  │
+              s0 s1 s2 s3  <- site indices
+
+            i=0, 1, 2, 3, ...
+
+    ``sites_location="diag"``::
+
+        ...   .  .  s3 ╭──
+                      ╲│
+        j=2   .  s2 ╭──O──...
+                   ╲│  │
+        j=1   s1 ╭──O──O──...
+                ╲│  │  │
+        j=0  s0──O──O──O──...
+
+            i=0, 1, 2, 3, ...
+
+    Parameters
+    ----------
+    Jij : array_like or dict[(int, int), float]
+        The couplings, as a square matrix or explicit dict. If a matrix, the
+        upper or lower triangle (corresponding to ``UPLO``) should the pairwise
+        interaction strengths. If a dict, then each non-zero interaction can be
+        specified explicitly.
+    beta : float
+        The inverse temperature.
+    outputs : sequence of int, optional
+        Which sites to generate output indices (i.e. dangling legs) for.
+        The index is named according to ``ind_id``. The location of the output
+        depends on ``sites_location``.
+    ordering : sequence of int, optional
+        If supplied, the ordering of the embedded spins into the lattice.
+    sites_location : {"side", "diag"}, optional
+        Whether to place the output indices on the side or diagonally. If
+        ``"side"`` then the output indices will be placed along the 'y-min'
+        border, i.e. ``[(j, 0) for j in range(1, N)]``, with two on the first
+        tensor. If ``"diag"`` then the output indices will be placed along the
+        central diagonal fold of the lattice, i.e.
+        ``[(j + 1, j) for j in range(1, N)]``, with two on the first tensor.
+    UPLO : {"auto", "L", "U"}, optional
+        Whether to read the couplings in from ``J`` in lower ('L': ``i >= j``)
+        or upper ('U': ``i <= j``) form. If ``J`` is a dict then this only
+        matters if both are present and in that case acts as a preference.
+        If ``"auto"`` then either the lower or upper, or symmetric distances
+        can be supplied, but an error is raised if both are.
+    contract_sites : bool, optional
+        Whether to contract the sites of the TN, which after initial
+        construction will have one horizontol spin-rail, one vertical spin-rail
+        and one interaction tensor per site.
+    site_tag_id : str, optional
+        String formatter specifying how to label each site.
+    x_tag_id : str, optional
+        String formatter specifying how to label each x-plane.
+    y_tag_id : str, optional
+        String formatter specifying how to label each y-plane.
+    ind_id : str, optional
+        How to label the indices i.e. ``ind_id.format(i)``, each of
+        which corresponds to a single classical spin in ``outputs``.
+
+    Returns
+    -------
+    TensorNetwork2D
+    """
+    Jij = make_couplings_matrix_symmetric(Jij, UPLO=UPLO)
+    N = Jij.shape[0]
+
+    if isinstance(outputs, int):
+        outputs = (outputs,)
+    outputs = set(outputs)
+
+    tn = TensorNetwork2D.new(
+        Lx=N,
+        Ly=N,
+        site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id,
+        y_tag_id=y_tag_id,
+    )
+
+    bonds = collections.defaultdict(rand_uuid)
+    triangle_sites = [(i, j) for i in range(N) for j in range(i)]
+
+    for i, j in triangle_sites:
+        ix_hvar = ix_vvar = ix_left = ix_right = ix_down = ix_up = None
+
+        if ordering is None:
+            oi, oj = i, j
+        else:
+            oi, oj = ordering[i], ordering[j]
+
+        if sites_location == "side":
+            # ...   .  .  .  ╭──
+            #                │
+            # j=2   .  .  ╭──O──...
+            #             │  │
+            # j=1   .  ╭──O──O──...
+            #          │  │  │
+            # j=0   ╭──O──O──O──...
+            #       │  │  │  │
+            #       s0 s1 s2 s3  <- site indices
+            #
+            #     i=0, 1, 2, 3, ...
+            if j + 1 == i:
+                # add diagonal bond
+                if j == 0:
+                    # lower left, left index is 0th site index
+                    ix_hvar = ind_id.format(oj)
+                else:
+                    # left index connects diagonally to up index
+                    ix_left = bonds[(i - 1, j - 1), (i - 1, j)]
+            else:
+                # bulk left bond
+                ix_left = bonds[(i - 1, j), (i, j)]
+
+            if i + 1 < N:
+                # bulk right bond
+                ix_right = bonds[(i, j), (i + 1, j)]
+
+            if j == 0:
+                # bottom edge - down bond is site index
+                ix_vvar = ind_id.format(oi)
+            else:
+                ix_down = bonds[(i, j - 1), (i, j)]
+
+            if j + 2 < N:
+                # bulk up bond
+                ix_up = bonds[(i, j), (i, j + 1)]
+
+        else:  # sites_location == "diag"
+            # ...   .  .  s3 ╭──
+            #               ╲│
+            # j=2   .  s2 ╭──O──...
+            #            ╲│  │
+            # j=1   s1 ╭──O──O──...
+            #         ╲│  │  │
+            # j=0  s0──O──O──O──...
+            #
+            #     i=0, 1, 2, 3, ...
+            if j + 1 == i:
+                # add diagonal bond
+                ix_vvar = ind_id.format(oi)
+                if j == 0:
+                    # lower left, left index is 0th site index
+                    ix_hvar = ind_id.format(oj)
+                else:
+                    ix_left = bonds[(i - 1, j - 1), (i - 1, j)]
+            else:
+                # bulk left bond
+                ix_left = bonds[(i - 1, j), (i, j)]
+
+            if i + 1 < N:
+                # bulk right bond
+                ix_right = bonds[(i, j), (i + 1, j)]
+
+            if j > 0:
+                # bulk down bond
+                ix_down = bonds[(i, j - 1), (i, j)]
+
+            if j + 2 < N:
+                # bulk up bond
+                ix_up = bonds[(i, j), (i, j + 1)]
+
+        # only place output indices for specific outputs
+        if oi not in outputs:
+            ix_vvar = None
+        if oj not in outputs:
+            ix_hvar = None
+
+        # add cross rails
+        x_inds = tuple(filter(None, (ix_hvar, ix_left, ix_right, f"k{i},{j}")))
+        y_inds = tuple(filter(None, (ix_vvar, ix_down, ix_up, f"b{i},{j}")))
+
+        these_tags = (
+            x_tag_id.format(i),
+            y_tag_id.format(j),
+            site_tag_id.format(i, j),
+        )
+
+        # connect horizontal and vertical rails to interaction indices
+        tn |= COPY_tensor(2, inds=x_inds, tags=these_tags)
+        tn |= COPY_tensor(2, inds=y_inds, tags=these_tags)
+
+        try:
+            this_j = Jij[i, j]
+        except KeyError:
+            this_j = Jij[j, i]
+
+        # add the interaction tensor
+        tn |= Tensor(
+            data=classical_ising_S_matrix(beta, this_j),
+            inds=[f"k{i},{j}", f"b{i},{j}"],
+            tags=these_tags,
+        )
+
+    if contract_sites:
+        for i, j in triangle_sites:
+            try:
+                tn ^= (i, j)
+            except KeyError:
+                pass
+
     return tn
 
 
@@ -2558,6 +3281,10 @@ def cnf_file_parse(fname):
         for line in f:
             args = line.split()
 
+            # ignore empty lines, other comments and info line
+            if (not args) or (args == ["0"]) or (args[0][0] in "c%"):
+                continue
+
             # global info, just record
             if args[0] == "p":
                 # args[1] specifies task
@@ -2587,10 +3314,6 @@ def cnf_file_parse(fname):
                     continue
 
                 weights[int(sgn_var)] = float(w)
-                continue
-
-            # ignore empty lines, other comments and info line
-            if (not args) or (args == ["0"]) or (args[0][0] in "c%"):
                 continue
 
             # clause tensor, drop last '0' (endline marker) and empty strings
@@ -2804,6 +3527,72 @@ def HTN_random_ksat(
     )
 
 
+def TN1D_matching(tn, max_bond, site_tags=None, dtype=None, **randn_opts):
+    """Create a 1D tensor network with the same outer indices as ``tn`` but
+    with a single tensor per site with bond dimension ``max_bond`` between
+    joining each site. Generally to be used as an initial guess for fitting.
+
+    Parameters
+    ----------
+    tn : TensorNetwork
+        The tensor network to match, it can have arbitrary local structure and
+        output indices, as long as ``site_tags`` effectively partitions it.
+    max_bond : int
+        The bond dimension to use between each site.
+    site_tags : sequence of str, optional
+        The tags to use to select the tensors from ``tn``. If not given, uses
+        ``tn.site_tags``. The tensor network built will have one tensor per
+        site, in the order given by ``site_tags``.
+    dtype : dtype, optional
+        The data type to use for the new tensors, if not given uses the same as
+        the original tensors.
+    randn_opts
+        Supplied to :func:`~quimb.gen.rand.randn`.
+
+    Returns
+    -------
+    TensorNetwork
+    """
+    if site_tags is None:
+        site_tags = tn.site_tags
+
+    if dtype is None:
+        dtype = tn.dtype
+
+    tn_fit = TensorNetwork()
+
+    all_outer_ix = set(tn.outer_inds())
+    bonds = collections.defaultdict(rand_uuid)
+
+    for i, site in enumerate(site_tags):
+        # get local network at site
+        tni = tn.select(site)
+        # get all local indices which as also outer indices
+        loix = tuple(ix for ix in tni.ind_map if ix in all_outer_ix)
+        # also inherit all local tags
+        ltags = tni.tags
+
+        shape = []
+        inds = []
+        # add bond dimensions
+        if i > 0:
+            shape.append(max_bond)
+            inds.append(bonds[i - 1, i])
+        if i < len(site_tags) - 1:
+            shape.append(max_bond)
+            inds.append(bonds[i, i + 1])
+        # add physical/outer dimensions
+        shape.extend(map(tn.ind_size, loix))
+        inds.extend(loix)
+
+        tn_fit |= rand_tensor(
+            shape=shape, inds=inds, tags=ltags, dtype=dtype, **randn_opts
+        )
+
+    # finally cast the new network as the same type as the original
+    return tn_fit.view_like_(tn)
+
+
 # --------------------------------------------------------------------------- #
 #                                    MPSs                                     #
 # --------------------------------------------------------------------------- #
@@ -2817,6 +3606,7 @@ def MPS_rand_state(
     normalize=True,
     cyclic=False,
     dtype="float64",
+    dist="normal",
     trans_invar=False,
     **mps_opts,
 ):
@@ -2843,45 +3633,49 @@ def MPS_rand_state(
     mps_opts
         Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductState`.
     """
-    if trans_invar and not cyclic:
-        raise ValueError(
-            "State cannot be translationally invariant with open "
-            "boundary conditions."
+    if trans_invar:
+        if not cyclic:
+            raise ValueError(
+                "State cannot be translationally invariant with open "
+                "boundary conditions."
+            )
+        array = sensibly_scale(
+            randn(
+                shape=(bond_dim, bond_dim, phys_dim),
+                dtype=dtype,
+                dist=dist,
+            )
         )
 
-    # check for site varying physical dimensions
-    if isinstance(phys_dim, Integral):
-        phys_dims = itertools.repeat(phys_dim)
+        def fill_fn(shape):
+            return array
+
     else:
-        phys_dims = itertools.cycle(phys_dim)
 
-    cyc_dim = (bond_dim,) if cyclic else ()
+        def fill_fn(shape):
+            return sensibly_scale(randn(shape, dtype=dtype, dist=dist))
 
-    def gen_shapes():
-        yield (*cyc_dim, bond_dim, next(phys_dims))
-        for _ in range(L - 2):
-            yield (bond_dim, bond_dim, next(phys_dims))
-        yield (bond_dim, *cyc_dim, next(phys_dims))
-
-    def gen_data(shape):
-        return randn(shape, dtype=dtype)
-
-    if trans_invar:
-        array = sensibly_scale(gen_data(next(gen_shapes())))
-        arrays = (array for _ in range(L))
-    else:
-        arrays = map(sensibly_scale, map(gen_data, gen_shapes()))
-
-    rmps = MatrixProductState(arrays, **mps_opts)
+    mps = MatrixProductState.from_fill_fn(
+        fill_fn,
+        L=L,
+        bond_dim=bond_dim,
+        phys_dim=phys_dim,
+        cyclic=cyclic,
+        **mps_opts,
+    )
 
     if normalize == "left":
-        rmps.left_canonize(normalize=True)
+        if cyclic:
+            raise ValueError("Cannot left normalize cyclic MPS.")
+        mps.left_canonize(normalize=True)
     elif normalize == "right":
-        rmps.left_canonize(normalize=True)
+        if cyclic:
+            raise ValueError("Cannot right normalize cyclic MPS.")
+        mps.left_canonize(normalize=True)
     elif normalize:
-        rmps /= (rmps.H @ rmps) ** 0.5
+        mps.normalize()
 
-    return rmps
+    return mps
 
 
 def MPS_product_state(arrays, cyclic=False, **mps_opts):
@@ -3096,15 +3890,18 @@ def MPS_zero_state(
     mps_opts
         Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductState`.
     """
-    cyc_dim = (bond_dim,) if cyclic else ()
 
-    def gen_arrays():
-        yield np.zeros((*cyc_dim, bond_dim, phys_dim), dtype=dtype)
-        for _ in range(L - 2):
-            yield np.zeros((bond_dim, bond_dim, phys_dim), dtype=dtype)
-        yield np.zeros((bond_dim, *cyc_dim, phys_dim), dtype=dtype)
+    def fill_fn(shape):
+        return np.zeros(shape, dtype=dtype)
 
-    return MatrixProductState(gen_arrays(), **mps_opts)
+    return MatrixProductState.from_fill_fn(
+        fill_fn,
+        L=L,
+        bond_dim=bond_dim,
+        phys_dim=phys_dim,
+        cyclic=cyclic,
+        **mps_opts,
+    )
 
 
 def MPS_sampler(L, dtype=complex, squeeze=True, **mps_opts):
@@ -3268,6 +4065,7 @@ def MPO_rand(
     cyclic=False,
     herm=False,
     dtype="float64",
+    dist="normal",
     **mpo_opts,
 ):
     """Generate a random matrix product state.
@@ -3287,6 +4085,8 @@ def MPO_rand(
         open boundary conditions.
     dtype : {float, complex} or numpy dtype, optional
         Data type of the tensor network.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
     herm : bool, optional
         Whether to make the matrix hermitian (or symmetric if real) or not.
     mpo_opts
@@ -3301,7 +4101,7 @@ def MPO_rand(
     ]
 
     def gen_data(shape):
-        data = randn(shape, dtype=dtype)
+        data = randn(shape, dtype=dtype, dist=dist)
         if not herm:
             return data
 
@@ -4221,7 +5021,7 @@ def MPO_ham_bilinear_biquadratic(
     H = _ham_bilinear_biquadratic(theta, S=S, cyclic=cyclic)
     H_mpo = H.build_mpo(L, **mpo_opts)
     if compress is True:
-        H_mpo.compress(cutoff=1e-12, cutoff_mode="rel" if cyclic else "sum2")
+        H_mpo.compress(cutoff=1e-12, cutoff_mode="rel" if cyclic else "rsum2")
     return H_mpo
 
 

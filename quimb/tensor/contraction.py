@@ -308,8 +308,8 @@ def array_contract_path(*args, optimize=None, **kwargs):
         optimize = get_contract_strategy()
     return ctg.array_contract_path(*args, optimize=optimize, **kwargs)
 
-
 def array_contract_pathinfo(*args, **kwargs):
+
     import opt_einsum as oe
 
     tree = array_contract_tree(*args, **kwargs)
@@ -325,6 +325,12 @@ def array_contract_pathinfo(*args, **kwargs):
     shapes = tree.get_shapes()
     path = tree.get_path()
     eq = tree.get_eq()
+
+    if (eq == "->") and (len(path) == 0):
+        # XXX: opt_einsum does not support empty paths
+        # https://github.com/jcmgray/quimb/issues/231
+        # https://github.com/dgasmith/opt_einsum/pull/229
+        path = ((0,),)
 
     return oe.contract_path(eq, *shapes, shapes=True, optimize=path)[1]
 

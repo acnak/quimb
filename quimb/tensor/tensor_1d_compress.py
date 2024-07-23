@@ -11,18 +11,116 @@ network can locally have arbitrary structure and outer indices.
 - [x] the autofit method (via non-1d specific ALS or autodiff)
 
 """
+
 import collections
 import itertools
 import warnings
 
+from autoray import do
+
 from .tensor_arbgeom import tensor_network_apply_op_vec
-from .tensor_builder import TN1D_matching
+from .tensor_arbgeom_compress import tensor_network_ag_compress
+from .tensor_builder import TN_matching
 from .tensor_core import (
+    Tensor,
     TensorNetwork,
     ensure_dict,
     rand_uuid,
     tensor_contract,
 )
+
+
+def enforce_1d_like(tn, site_tags=None, fix_bonds=True, inplace=False):
+    """Check that ``tn`` is 1D-like with OBC, i.e. 1) that each tensor has
+    exactly one of the given ``site_tags``. If not, raise a ValueError. 2) That
+    there are no hyper indices. And 3) that there are only bonds within sites
+    or between nearest neighbor sites. This issue can be optionally
+    automatically fixed by inserting a string of identity tensors.
+
+    Parameters
+    ----------
+    tn : TensorNetwork
+        The tensor network to check.
+    site_tags : sequence of str, optional
+        The tags to use to group and order the tensors from ``tn``. If not
+        given, uses ``tn.site_tags``.
+    fix_bonds : bool, optional
+        Whether to fix the bond structure by inserting identity tensors.
+    inplace : bool, optional
+        Whether to perform the fix inplace or not.
+
+    Raises
+    ------
+    ValueError
+        If the tensor network is not 1D-like.
+    """
+    tn = tn if inplace else tn.copy()
+
+    if site_tags is None:
+        site_tags = tn.site_tags
+
+    tag_to_site = {tag: i for i, tag in enumerate(site_tags)}
+    tid_to_site = {}
+
+    def _check_tensor_site(tid, t):
+        if tid in tid_to_site:
+            return tid_to_site[tid]
+
+        sites = []
+        for tag in t.tags:
+            site = tag_to_site.get(tag, None)
+            if site is not None:
+                sites.append(site)
+        if len(sites) != 1:
+            raise ValueError(
+                f"{t} does not have one site tag, it has {sites}."
+            )
+
+        return sites[0]
+
+    for ix, tids in list(tn.ind_map.items()):
+        if len(tids) == 1:
+            # assume outer
+            continue
+        elif len(tids) != 2:
+            raise ValueError(
+                f"TN has a hyper index, {ix}, connecting more than 2 tensors."
+            )
+
+        tida, tidb = tids
+        ta = tn.tensor_map[tida]
+        tb = tn.tensor_map[tidb]
+
+        # get which single site each tensor belongs too
+        sa = _check_tensor_site(tida, ta)
+        sb = _check_tensor_site(tidb, tb)
+        if sa > sb:
+            sa, sb = sb, sa
+
+        if sb - sa > 1:
+            if not fix_bonds:
+                raise ValueError(
+                    f"Tensor {ta} and {tb} are not nearest "
+                    "neighbors, and `fix_bonds=False`."
+                )
+
+            # not 1d like: bond is not nearest neighbor
+            # but can insert identites along string to fix
+            data = do("eye", ta.ind_size(ix), like=ta.data)
+
+            ixl = ix
+            for i in range(sa + 1, sb):
+                ixr = rand_uuid()
+                tn |= Tensor(
+                    data=data,
+                    inds=[ixl, ixr],
+                    tags=site_tags[i],
+                )
+                ixl = ixr
+
+            tb.reindex_({ix: ixl})
+
+    return tn
 
 
 def possibly_permute_(tn, permute_arrays):
@@ -109,12 +207,12 @@ def tensor_network_1d_compress_direct(
         ``site_tags[0]`` ('right canonical' form) or ``site_tags[-1]`` ('left
         canonical' form) if ``sweep_reverse``.
     """
-    new = tn if inplace else tn.copy()
-
     if site_tags is None:
-        site_tags = new.site_tags
+        site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+
+    new = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
 
     # contract the first site group
     new.contract_tags_(site_tags[0], optimize=optimize)
@@ -186,6 +284,7 @@ def tensor_network_1d_compress_dm(
     optimize="auto-hq",
     sweep_reverse=False,
     canonize=True,
+    equalize_norms=False,
     inplace=False,
     **compress_opts,
 ):
@@ -230,6 +329,10 @@ def tensor_network_1d_compress_dm(
         canonical form instead of right canonical.
     canonize : bool, optional
         Dummy argument to match the signature of other compression methods.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is give, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
     compress_opts
@@ -249,8 +352,9 @@ def tensor_network_1d_compress_dm(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
-
     N = len(site_tags)
+
+    ket = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
 
     # partition outer indices, and create conjugate bra indices
     ket_site_inds = []
@@ -259,7 +363,7 @@ def tensor_network_1d_compress_dm(
     for tag in site_tags:
         k_inds_i = []
         b_inds_i = []
-        for kix in tn.select(tag)._outer_inds & tn._outer_inds:
+        for kix in ket.select(tag)._outer_inds & ket._outer_inds:
             bix = rand_uuid()
             k_inds_i.append(kix)
             b_inds_i.append(bix)
@@ -267,7 +371,6 @@ def tensor_network_1d_compress_dm(
         ket_site_inds.append(tuple(k_inds_i))
         bra_site_inds.append(tuple(b_inds_i))
 
-    ket = tn.copy()
     bra = ket.H
     # doing this means forming the norm doesn't do its own mangling
     bra.mangle_inner_()
@@ -310,7 +413,11 @@ def tensor_network_1d_compress_dm(
             right_inds.append(new_bonds["b", i + 1])
 
         # contract and then split it
-        rhoi = tensor_contract(*rho_tensors, optimize=optimize)
+        rhoi = tensor_contract(
+            *rho_tensors,
+            preserve_tensor=True,
+            optimize=optimize,
+        )
         U, s, UH = rhoi.split(
             left_inds=left_inds,
             right_inds=right_inds,
@@ -370,6 +477,12 @@ def tensor_network_1d_compress_dm(
     # possibly put the array indices in canonical order (e.g. when MPS or MPO)
     possibly_permute_(new, permute_arrays)
 
+    # XXX: do better than simply waiting til the end to equalize norms
+    if equalize_norms is True:
+        new.equalize_norms_()
+    elif equalize_norms:
+        new.equalize_norms_(value=equalize_norms)
+
     return new
 
 
@@ -384,6 +497,7 @@ def tensor_network_1d_compress_zipup(
     permute_arrays=True,
     optimize="auto-hq",
     sweep_reverse=False,
+    equalize_norms=False,
     inplace=False,
     **compress_opts,
 ):
@@ -430,6 +544,10 @@ def tensor_network_1d_compress_zipup(
     sweep_reverse : bool, optional
         Whether to sweep in the reverse direction, resulting in a left
         canonical form instead of right canonical.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is give, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
     compress_opts
@@ -448,6 +566,8 @@ def tensor_network_1d_compress_zipup(
         site_tags = tuple(reversed(site_tags))
     N = len(site_tags)
 
+    tn = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
+
     # calculate the local site (outer) indices
     site_inds = [
         tuple(tn.select(tag)._outer_inds & tn._outer_inds) for tag in site_tags
@@ -462,7 +582,7 @@ def tensor_network_1d_compress_zipup(
         #     │ │ │ │ │ │ │ │ │ │
         #     ▶─▶─▶─▶─▶─▶─▶─▶─▶─○  MPS
         #
-        tn = tn.canonize_around(site_tags[-1], inplace=inplace)
+        tn = tn.canonize_around_(site_tags[-1])
 
     # zip along the bonds
     ts = []
@@ -478,9 +598,13 @@ def tensor_network_1d_compress_zipup(
         #        .... contract
         if Us is None:
             # first site
-            C = tn.select(site_tags[i]).contract(optimize=optimize)
+            C = tensor_contract(
+                *tn.select_tensors(site_tags[i]), optimize=optimize
+            )
         else:
-            C = (Us | tn.select(site_tags[i])).contract(optimize=optimize)
+            C = tensor_contract(
+                Us, *tn.select_tensors(site_tags[i]), optimize=optimize
+            )
         #         i
         #      │  │    │ │
         #     ─▶──□━━━━◀━◀━
@@ -514,7 +638,9 @@ def tensor_network_1d_compress_zipup(
         #     ─▶  : :
         #       U*s VH
 
-    U0 = (Us | tn.select(site_tags[0])).contract(optimize=optimize)
+    U0 = tensor_contract(
+        Us, *tn.select_tensors(site_tags[0]), optimize=optimize
+    )
 
     if normalize:
         # in right canonical form already
@@ -535,6 +661,12 @@ def tensor_network_1d_compress_zipup(
     # possibly put the array indices in canonical order (e.g. when MPS or MPO)
     possibly_permute_(new, permute_arrays)
 
+    # XXX: do better than simply waiting til the end to equalize norms
+    if equalize_norms is True:
+        new.equalize_norms_()
+    elif equalize_norms:
+        new.equalize_norms_(value=equalize_norms)
+
     return new
 
 
@@ -551,6 +683,7 @@ def tensor_network_1d_compress_zipup_first(
     permute_arrays=True,
     optimize="auto-hq",
     sweep_reverse=False,
+    equalize_norms=False,
     inplace=False,
     **compress_opts,
 ):
@@ -605,6 +738,10 @@ def tensor_network_1d_compress_zipup_first(
     sweep_reverse : bool, optional
         Whether to sweep in the reverse direction, resulting in a left
         canonical form instead of right canonical.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is give, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
     compress_opts
@@ -644,6 +781,7 @@ def tensor_network_1d_compress_zipup_first(
         cutoff_mode=cutoff_mode,
         optimize=optimize,
         sweep_reverse=True,
+        equalize_norms=equalize_norms,
         inplace=inplace,
         **compress_opts,
     )
@@ -658,6 +796,7 @@ def tensor_network_1d_compress_zipup_first(
             max_bond=max_bond,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            equalize_norms=equalize_norms,
             **compress_opts,
         )
 
@@ -667,6 +806,11 @@ def tensor_network_1d_compress_zipup_first(
 
     # possibly put the array indices in canonical order (e.g. when MPS or MPO)
     possibly_permute_(tn, permute_arrays)
+
+    if equalize_norms is True:
+        tn.equalize_norms_()
+    elif equalize_norms:
+        tn.equalize_norms_(value=equalize_norms)
 
     return tn
 
@@ -680,6 +824,7 @@ def _tn1d_fit_sum_sweep_1site(
     envs=None,
     prepare=True,
     reverse=False,
+    compute_tdiff=True,
     optimize="auto-hq",
 ):
     """Core sweep of the 1-site 1D fit algorithm."""
@@ -782,9 +927,10 @@ def _tn1d_fit_sum_sweep_1site(
 
         tfinew.conj_()
 
-        # track change in tensor norm
-        dt = tfi.distance_normalized(tfinew)
-        max_tdiff = max(max_tdiff, dt)
+        if compute_tdiff:
+            # track change in tensor norm
+            dt = tfi.distance_normalized(tfinew)
+            max_tdiff = max(max_tdiff, dt)
 
         # reinsert into all viewing tensor networks
         tfi.modify(data=tfinew.data)
@@ -802,6 +948,7 @@ def _tn1d_fit_sum_sweep_2site(
     prepare=True,
     reverse=False,
     optimize="auto-hq",
+    compute_tdiff=True,
     **compress_opts,
 ):
     """Core sweep of the 2-site 1D fit algorithm."""
@@ -906,9 +1053,10 @@ def _tn1d_fit_sum_sweep_2site(
             **compress_opts,
         )
 
-        # track change in tensor norm
-        dt = (tfi0 | tfi1).distance_normalized(tfinew0 | tfinew1)
-        max_tdiff = max(max_tdiff, dt)
+        if compute_tdiff:
+            # track change in tensor norm
+            dt = (tfi0 | tfi1).distance_normalized(tfinew0 | tfinew1)
+            max_tdiff = max(max_tdiff, dt)
 
         # reinsert into all viewing tensor networks
         tfinew0.transpose_like_(tfi0)
@@ -936,6 +1084,7 @@ def tensor_network_1d_compress_fit(
     optimize="auto-hq",
     canonize=True,
     sweep_reverse=False,
+    equalize_norms=False,
     inplace_fit=False,
     inplace=False,
     progbar=False,
@@ -1011,12 +1160,16 @@ def tensor_network_1d_compress_fit(
         string this specifies a custom order.
     optimize : str, optional
         The contraction path optimizer to use.
+    canonize : bool, optional
+        Dummy argument to match the signature of other compression methods.
     sweep_reverse : bool, optional
         Whether to sweep in the reverse direction, swapping whether the final
         tensor network is in right or left canonical form, which also depends
         on the last sweep direction.
-    canonize : bool, optional
-        Dummy argument to match the signature of other compression methods.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is give, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
     inplace_fit : bool, optional
         Whether to perform the compression inplace on the initial guess tensor
         network, ``tn_fit``, if supplied.
@@ -1054,6 +1207,10 @@ def tensor_network_1d_compress_fit(
         site_tags = next(
             tn.site_tags for tn in tns if hasattr(tn, "site_tags")
         )
+
+    tns = tuple(
+        enforce_1d_like(tn, site_tags=site_tags, inplace=inplace) for tn in tns
+    )
 
     # choose the block size of the sweeping function
     if bsz == "auto":
@@ -1095,7 +1252,7 @@ def tensor_network_1d_compress_fit(
 
         if tn_fit is None:
             # random initial guess
-            tn_fit = TN1D_matching(
+            tn_fit = TN_matching(
                 tns[0], max_bond=current_bond_dim, site_tags=site_tags
             )
         else:
@@ -1138,6 +1295,9 @@ def tensor_network_1d_compress_fit(
 
         its = ProgBar(its, total=max_iterations)
 
+    # whether to compute the maximum change in tensor norm
+    compute_tdiff = (tol != 0.0) or progbar
+
     try:
         for i in its:
             next_direction = next(sweeps)
@@ -1160,6 +1320,7 @@ def tensor_network_1d_compress_fit(
                 site_tags=site_tags,
                 reverse=reverse,
                 optimize=optimize,
+                compute_tdiff=compute_tdiff,
                 **compress_opts,
             )
 
@@ -1196,112 +1357,13 @@ def tensor_network_1d_compress_fit(
     # possibly put the array indices in canonical order (e.g. when MPS or MPO)
     possibly_permute_(tn_fit, permute_arrays)
 
+    # XXX: do better than simply waiting til the end to equalize norms
+    if equalize_norms is True:
+        tn_fit.equalize_norms_()
+    elif equalize_norms:
+        tn_fit.equalize_norms_(value=equalize_norms)
+
     return tn_fit
-
-
-def tensor_network_1d_compress_projector(
-    tn,
-    max_bond=None,
-    cutoff=1e-10,
-    site_tags=None,
-    canonize=True,
-    canonize_opts=None,
-    cutoff_mode="rsum2",
-    lazy=False,
-    permute_arrays=True,
-    optimize="auto-hq",
-    sweep_reverse=False,
-    inplace=False,
-    **compress_opts,
-):
-    """Compress a 1D-like tensor network using the local projector method, in
-    the style of CTMRG or HOTRG. The projectors only contain information about
-    the local neighborhood tensors (although pre-gauging the network with
-    ``canonize=True`` can mitigate this somewhat) which significantly limits
-    the accuracy in most cases.
-
-    Parameters
-    ----------
-    tn : TensorNetwork
-        The tensor network to compress. Every tensor should have exactly one of
-        the site tags. Each site can have multiple tensors and output indices.
-    max_bond : int
-        The maximum bond dimension to compress to.
-    cutoff : float, optional
-        A dynamic threshold for discarding singular values when compressing.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
-    canonize : bool, optional
-        Whether to pseudo canonicalize the initial tensor network.
-    canonize_opts
-        Supplied to :meth:`~quimb.tensor.tensor_core.TensorNetwork.gauge_all`.
-    cutoff_mode : {"rsum2", "rel", ...}, optional
-        The mode to use when truncating the singular values of the decomposed
-        tensors. See :func:`~quimb.tensor.tensor_split`.
-    lazy : bool, optional
-        Whether to leave the computed projectors uncontracted, default: False.
-    permute_arrays : bool or str, optional
-        Whether to permute the array indices of the final tensor network into
-        canonical order. If ``True`` will use the default order, otherwise if a
-        string this specifies a custom order.
-    optimize : str, optional
-        The contraction path optimizer to use for computing the projectors
-        and contracting them into the network.
-    sweep_reverse : bool, optional
-        Dummy argument to match the signature of other compression methods.
-    inplace : bool, optional
-        Whether to perform the compression inplace.
-    compress_opts
-        Supplied to :func:`~quimb.tensor.tensor_split`.
-
-    Returns
-    -------
-    TensorNetwork
-    """
-    if sweep_reverse:
-        warnings.warn("sweep_reverse has no effect for the projector method.")
-
-    tn = tn if inplace else tn.copy()
-
-    if site_tags is None:
-        site_tags = tn.site_tags
-    N = len(site_tags)
-
-    if canonize:
-        # precondition
-        canonize_opts = ensure_dict(canonize_opts)
-        tn.gauge_all_(**canonize_opts)
-
-    tn_calc = tn.copy()
-    for i in range(N - 1):
-        ltags = (site_tags[i],)
-        rtags = (site_tags[i + 1],)
-
-        tn_calc.insert_compressor_between_regions_(
-            ltags,
-            rtags,
-            new_ltags=ltags,
-            new_rtags=rtags,
-            max_bond=max_bond,
-            cutoff=cutoff,
-            cutoff_mode=cutoff_mode,
-            insert_into=tn,
-            optimize=optimize,
-            **compress_opts,
-        )
-
-    if not lazy:
-        for i in range(N):
-            tn.contract_tags_(site_tags[i], optimize=optimize)
-
-        if permute_arrays:
-            # possibly put the array indices in
-            # canonical order (e.g. when MPS or MPO)
-            possibly_permute_(tn, permute_arrays)
-
-    return tn
 
 
 _TN1D_COMPRESS_METHODS = {
@@ -1310,7 +1372,6 @@ _TN1D_COMPRESS_METHODS = {
     "zipup": tensor_network_1d_compress_zipup,
     "zipup-first": tensor_network_1d_compress_zipup_first,
     "fit": tensor_network_1d_compress_fit,
-    "projector": tensor_network_1d_compress_projector,
 }
 
 
@@ -1360,6 +1421,10 @@ def tensor_network_1d_compress(
         Whether to sweep in the reverse direction, resulting in a left
         canonical form instead of right canonical (for the fit method, this
         also depends on the last sweep direction).
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is give, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
     inplace : bool, optional
         Whether to perform the compression inplace.
     kwargs
@@ -1371,19 +1436,48 @@ def tensor_network_1d_compress(
     """
     compress_opts = compress_opts or {}
 
-    return _TN1D_COMPRESS_METHODS[method](
+    f_tn1d = _TN1D_COMPRESS_METHODS.get(method, None)
+    if f_tn1d is not None:
+        # 1D specific compression methods
+        return f_tn1d(
+            tn,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            site_tags=site_tags,
+            canonize=canonize,
+            permute_arrays=permute_arrays,
+            optimize=optimize,
+            sweep_reverse=sweep_reverse,
+            equalize_norms=equalize_norms,
+            inplace=inplace,
+            **compress_opts,
+            **kwargs,
+        )
+
+    # generic tensor network compression methods
+    if sweep_reverse:
+        warnings.warn(
+            "sweep_reverse has no effect for arbitrary geometry (AG) methods."
+        )
+
+    tnc = tensor_network_ag_compress(
         tn,
         max_bond=max_bond,
         cutoff=cutoff,
+        method=method,
         site_tags=site_tags,
         canonize=canonize,
-        permute_arrays=permute_arrays,
         optimize=optimize,
-        sweep_reverse=sweep_reverse,
+        equalize_norms=equalize_norms,
         inplace=inplace,
         **compress_opts,
         **kwargs,
     )
+
+    if permute_arrays:
+        possibly_permute_(tnc, permute_arrays)
+
+    return tnc
 
 
 # --------------- MPO-MPS gating using 1D compression methods --------------- #

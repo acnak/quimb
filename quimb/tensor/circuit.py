@@ -15,35 +15,38 @@ import re
 import warnings
 
 import numpy as np
-from autoray import do, reshape, backend_like
+from autoray import backend_like, do, reshape
 
 import quimb as qu
-from ..utils import progbar as _progbar
+
 from ..utils import (
+    LRU,
     concatv,
     deprecated,
     ensure_dict,
-    LRU,
     partition_all,
     partitionby,
+    tree_map,
+)
+from ..utils import progbar as _progbar
+from . import array_ops as ops
+from .tensor_1d import Dense1D, MatrixProductOperator
+from .tensor_arbgeom import TensorNetworkGenVector, TensorNetworkGenOperator
+from .tensor_builder import (
+    HTN_CP_operator_from_products,
+    MPO_identity_like,
+    MPS_computational_state,
+    TN_from_sites_computational_state,
 )
 from .tensor_core import (
+    PTensor,
+    Tensor,
     get_tags,
     oset_union,
-    PTensor,
     rand_uuid,
     tags_to_oset,
     tensor_contract,
-    Tensor,
 )
-from .tensor_builder import (
-    MPS_computational_state,
-    TN_from_sites_computational_state,
-    HTN_CP_operator_from_products,
-)
-from .tensor_arbgeom import TensorNetworkGenOperator
-from .tensor_1d import Dense1D
-from . import array_ops as ops
 
 
 def recursive_stack(x):
@@ -957,15 +960,29 @@ register_param_gate("SU4", su4_gate_param_gen, 2)
 
 # special non-tensor gates
 
+_MPS_METHODS = {
+    "auto-mps",
+    "nonlocal",
+    "swap+split",
+}
+
 
 def apply_swap(psi, i, j, **gate_opts):
     contract = gate_opts.pop("contract", None)
-    if contract == "swap+split":
-        gate_opts.pop("propagate_tags", None)
-        psi.swap_sites_with_compress_(i, j, **gate_opts)
-    else:
+
+    if contract not in _MPS_METHODS:
+        # just do swap by lazily reindexing
         iind, jind = map(psi.site_ind, (int(i), int(j)))
         psi.reindex_({iind: jind, jind: iind})
+    else:
+        # tensors are absorbed so propagate_tags is not needed
+        gate_opts.pop("propagate_tags", None)
+
+        if contract == "nonlocal":
+            psi.gate_nonlocal_(qu.swap(2), (i, j), **gate_opts)
+        else:  # {"swap+split", "auto-mps"}:
+            psi.swap_sites_with_compress_(i, j, **gate_opts)
+
 
 register_special_gate("SWAP", apply_swap, 2, array=qu.swap(2))
 register_special_gate("IDEN", lambda *_, **__: None, 1, array=qu.identity(2))
@@ -980,6 +997,9 @@ def build_controlled_gate_htn(
     tags_all=None,
     bond_ind=None,
 ):
+    """Build a low rank hyper tensor network (CP-decomp like) representation of
+    a multi controlled gate.
+    """
     ngate = len(gate.qubits)
     gate_shape = (2,) * (2 * ngate)
     array = gate.array.reshape(gate_shape)
@@ -1008,14 +1028,16 @@ def build_controlled_gate_htn(
     return htn
 
 
-def apply_controlled_gate(
-    psi,
-    gate,
-    tags=None,
-    contract="auto-split-gate",
-    propagate_tags="register",
+def _apply_controlled_gate_mps(psi, gate, tags=None, **gate_opts):
+    """Apply a multi-controlled gate to a state represented as an MPS."""
+    submpo = gate.build_mpo()
+    where = sorted((*gate.controls, *gate.qubits))
+    psi.gate_with_submpo_(submpo, where, **gate_opts)
+
+
+def _apply_controlled_gate_htn(
+    psi, gate, tags=None, propagate_tags="register", **gate_opts
 ):
-    assert contract == "auto-split-gate"
     assert propagate_tags == "register"
 
     all_qubits = (*gate.controls, *gate.qubits)
@@ -1041,7 +1063,32 @@ def apply_controlled_gate(
         htn,
         lower_inds,
         upper_inds,
+        **gate_opts,
     )
+
+
+def apply_controlled_gate(
+    psi,
+    gate,
+    tags=None,
+    contract="auto-split-gate",
+    propagate_tags="register",
+    **gate_opts,
+):
+    if contract in ("auto-mps", "nonlocal"):
+        _apply_controlled_gate_mps(psi, gate, tags=tags, **gate_opts)
+    elif contract in (
+        "auto-split-gate",
+        "split-gate",
+    ):
+        _apply_controlled_gate_htn(
+            psi, gate, tags=tags, propagate_tags=propagate_tags, **gate_opts
+        )
+    else:
+        raise ValueError(
+            f"Contract method '{contract}' not "
+            "supported for multi-controlled gates."
+        )
 
 @functools.lru_cache(2**15)
 def _cached_param_gate_build(fn, params):
@@ -1049,7 +1096,7 @@ def _cached_param_gate_build(fn, params):
 
 
 class Gate:
-    """A simple class for storing the details of a gate.
+    """A simple class for storing the details of a quantum circuit gate.
 
     Parameters
     ----------
@@ -1094,7 +1141,7 @@ class Gate:
         if self._label not in ALL_GATES:
             raise ValueError(f"Unknown gate: {self._label}.")
 
-        self._params = tuple(params)
+        self._params = ops.asarray(params)
         if qubits is None:
             self._qubits = None
         else:
@@ -1135,6 +1182,20 @@ class Gate:
         new._array = U
         return new
 
+    def copy(self):
+        new = object.__new__(self.__class__)
+        new._label = self._label
+        new._params = self._params
+        new._qubits = self._qubits
+        new._controls = self._controls
+        new._round = self._round
+        new._parametrize = self._parametrize
+        new._tag = self._tag
+        new._special = self._special
+        new._constant = self._constant
+        new._array = self._array
+        return new
+
     @property
     def label(self):
         return self._label
@@ -1146,6 +1207,20 @@ class Gate:
     @property
     def qubits(self):
         return self._qubits
+
+    @qubits.setter
+    def qubits(self, qubits):
+        if qubits is None:
+            self._qubits = None
+        else:
+            self._qubits = tuple(qubits)
+
+    @property
+    def total_qubit_count(self):
+        nq = len(self._qubits)
+        if self._controls:
+            nq += len(self._controls)
+        return nq
 
     @property
     def controls(self):
@@ -1167,9 +1242,21 @@ class Gate:
     def tag(self):
         return self._tag
 
+    def copy_with(self, **kwargs):
+        """Take a copy of this gate but with some attributes changed."""
+        label = kwargs.get("label", self._label)
+        params = kwargs.get("params", self._params)
+        qubits = kwargs.get("qubits", self._qubits)
+        controls = kwargs.get("controls", self._controls)
+        round = kwargs.get("round", self._round)
+        parametrize = kwargs.get("parametrize", self._parametrize)
+        return self.__class__(
+            label, params, qubits, controls, round, parametrize
+        )
+
     def build_array(self):
         """Build the array representation of the gate. For controlled gates
-        this excludes the control qubits.
+        this *excludes* the control qubits.
         """
         if self._special and (self._label not in CONSTANT_GATES):
             # these don't have an array representation
@@ -1196,6 +1283,37 @@ class Gate:
         if self._array is None:
             self._array = self.build_array()
         return self._array
+
+    def build_mpo(self, L=None, **kwargs):
+        """Build an MPO representation of this gate."""
+        G = self.array
+
+        if L is None:
+            L = max((*self.qubits, *self.controls), default=0) + 1
+
+        if not self.controls:
+            return MatrixProductOperator.from_dense(
+                G, sites=self.qubits, L=L, **kwargs
+            )
+
+        IG = qu.identity(2 ** len(self.qubits))
+        IG = reshape(IG, G.shape)
+        p1 = qu.down(qtype="dop")
+
+        # form (G - 1) on target qubits
+        mpo = MatrixProductOperator.from_dense(
+            G - IG, sites=self.qubits, L=L, **kwargs
+        )
+
+        # take tensor product with |11...><11...| on controls
+        mpo.fill_empty_sites_(mode=self.controls, fill_array=p1)
+
+        # add with identity on all qubits
+        mpo_I = MPO_identity_like(
+            mpo, sites=sorted((*self.qubits, *self.controls))
+        )
+
+        return mpo.add_MPO_(mpo_I)
 
     def __repr__(self):
         return (
@@ -1255,7 +1373,7 @@ def parse_to_gate(
         if gate_args:
             raise ValueError(
                 "You cannot specify ``gate_args`` for an already "
-                "encapsulated gate."
+                "encapsulated `Gate` object."
             )
 
         if any((params, qubits, controls, gate_round, parametrize)):
@@ -1329,7 +1447,9 @@ def parse_to_gate(
 
 
 class Circuit:
-    """Class for simulating quantum circuits using tensor networks.
+    """Class for simulating quantum circuits using tensor networks. The class
+    keeps a list of :class:`Gate` objects in sync with a tensor network
+    representing the current state of the circuit.
 
     Parameters
     ----------
@@ -1341,6 +1461,11 @@ class Circuit:
     gate_opts : dict_like, optional
         Default keyword arguments to supply to each
         :func:`~quimb.tensor.tensor_1d.gate_TN_1D` call during the circuit.
+    gate_contract : str, optional
+        Shortcut for setting the default `'contract'` option in `gate_opts`.
+    gate_propagate_tags : str, optional
+        Shortcut for setting the default `'propagate_tags'` option in
+        `gate_opts`.
     tags : str or sequence of str, optional
         Tag(s) to add to the initial wavefunction tensors (whether these are
         propagated to the rest of the circuit's tensors depends on
@@ -1349,6 +1474,21 @@ class Circuit:
         Ensure the initial state has this dtype.
     psi0_tag : str, optional
         Ensure the initial state has this tag.
+    tag_gate_numbers : bool, optional
+        Whether to tag each gate tensor with its number in the circuit, like
+        ``"GATE_{g}"``. This is required for updating the circuit parameters.
+    gate_tag_id : str, optional
+        The format string for tagging each gate tensor, by default e.g.
+        ``"GATE_{g}"``.
+    tag_gate_rounds : bool, optional
+        Whether to tag each gate tensor with its number in the circuit, like
+        ``"ROUND_{r}"``.
+    round_tag_id : str, optional
+        The format string for tagging each round of gates, by default e.g.
+        ``"ROUND_{r}"``.
+    tag_gate_labels : bool, optional
+        Whether to tag each gate tensor with its gate type label, e.g.
+        ``{"X_1/2", "ISWAP", "CCX", ...}``..
     bra_site_ind_id : str, optional
         Use this to label 'bra' site indices when creating certain (mostly
         internal) intermediate tensor networks.
@@ -1356,7 +1496,11 @@ class Circuit:
     Attributes
     ----------
     psi : TensorNetwork1DVector
-        The current wavefunction.
+        The current circuit wavefunction as a tensor network.
+    uni : TensorNetwork1DOperator
+        The current circuit unitary operator as a tensor network.
+    gates : tuple[Gate]
+        The gates in the circuit.
 
     Examples
     --------
@@ -1399,6 +1543,10 @@ class Circuit:
         111
         000
         000
+
+    See Also
+    --------
+    Gate
     """
 
     def __init__(
@@ -1411,7 +1559,13 @@ class Circuit:
         tags=None,
         psi0_dtype="complex128",
         psi0_tag="PSI0",
+        tag_gate_numbers=True,
+        gate_tag_id="GATE_{}",
+        tag_gate_rounds=True,
+        round_tag_id="ROUND_{}",
+        tag_gate_labels=True,
         bra_site_ind_id="b{}",
+        to_backend=None,
     ):
         if (N is None) and (psi0 is None):
             raise ValueError("You must supply one of `N` or `psi0`.")
@@ -1438,13 +1592,26 @@ class Circuit:
             for tag in tags:
                 self._psi.add_tag(tag)
 
+        self.tag_gate_numbers = tag_gate_numbers
+        self.tag_gate_rounds = tag_gate_rounds
+        self.tag_gate_labels = tag_gate_labels
+
+        self.to_backend = to_backend
+        if self.to_backend is not None:
+            self._psi.apply_to_arrays(self.to_backend)
+            self._backend_gate_cache = {}
+        else:
+            self._backend_gate_cache = None
+
         self.gate_opts = ensure_dict(gate_opts)
         self.gate_opts.setdefault("contract", gate_contract)
         self.gate_opts.setdefault("propagate_tags", gate_propagate_tags)
-        self.gates = []
+        self._gates = []
 
         self._ket_site_ind_id = self._psi.site_ind_id
         self._bra_site_ind_id = bra_site_ind_id
+        self._gate_tag_id = gate_tag_id
+        self._round_tag_id = round_tag_id
 
         if self._ket_site_ind_id == self._bra_site_ind_id:
             raise ValueError(
@@ -1454,12 +1621,63 @@ class Circuit:
                 )
             )
 
-        self.ket_site_ind = self._ket_site_ind_id.format
-        self.bra_site_ind = self._bra_site_ind_id.format
-
         self._sample_n_gates = -1
         self._storage = dict()
         self._sampled_conditionals = dict()
+
+    def copy(self):
+        """Copy the circuit and its state."""
+        new = object.__new__(self.__class__)
+        new.N = self.N
+        new._psi = self._psi.copy()
+        new.gate_opts = tree_map(lambda x: x, self.gate_opts)
+        new.tag_gate_numbers = self.tag_gate_numbers
+        new.tag_gate_rounds = self.tag_gate_rounds
+        new.tag_gate_labels = self.tag_gate_labels
+        new.to_backend = self.to_backend
+        new._backend_gate_cache = self._backend_gate_cache
+        new._gates = self._gates.copy()
+        new._ket_site_ind_id = self._ket_site_ind_id
+        new._bra_site_ind_id = self._bra_site_ind_id
+        new._gate_tag_id = self._gate_tag_id
+        new._round_tag_id = self._round_tag_id
+        new._sample_n_gates = self._sample_n_gates
+        new._storage = self._storage.copy()
+        new._sampled_conditionals = self._sampled_conditionals.copy()
+        return new
+
+    def apply_to_arrays(self, fn):
+        """Apply a function to all the arrays in the circuit."""
+        self._psi.apply_to_arrays(fn)
+
+    def get_params(self):
+        """Get a pytree - in this case a dict - of all the parameters in the
+        circuit.
+
+        Returns
+        -------
+        dict[int, tuple]
+            A dictionary mapping gate numbers to their parameters.
+        """
+        return {
+            i: self._psi[self.gate_tag(i)].params
+            for i, gate in enumerate(self._gates)
+            if gate.parametrize
+        }
+
+    def set_params(self, params):
+        """Set the parameters of the circuit.
+
+        Parameters
+        ----------
+        params : dict`
+            A dictionary mapping gate numbers to the new parameters.
+        """
+        for i, p in params.items():
+            self._psi[self.gate_tag(i)].params = p
+            self._gates[i] = self._gates[i].copy_with(params=ops.asarray(p))
+
+        self.clear_storage()
 
     @classmethod
     def from_qsim_str(cls, contents, **circuit_opts):
@@ -1519,36 +1737,111 @@ class Circuit:
         qc.apply_gates(info["gates"])
         return qc
 
+    @classmethod
+    def from_gates(cls, gates, N=None, progbar=False, **kwargs):
+        """Generate a ``Circuit`` instance from a sequence of gates.
+
+        Parameters
+        ----------
+        gates : sequence[Gate] or sequence[tuple]
+            The sequence of gates to apply.
+        N : int, optional
+            The number of qubits. If not given, will be inferred from the
+            gates.
+        progbar : bool, optional
+            Whether to show a progress bar.
+        kwargs
+            Supplied to the ``Circuit`` constructor.
+        """
+        if N is None:
+            gates = tuple(gates)
+
+            N = 0
+            for gate in gates:
+                if gate.qubits:
+                    N = max(N, max(gate.qubits) + 1)
+                if gate.controls:
+                    N = max(N, max(gate.controls) + 1)
+
+        qc = cls(N, **kwargs)
+        qc.apply_gates(gates, progbar=progbar)
+        return qc
+
+    @property
+    def gates(self):
+        return tuple(self._gates)
+
+    @property
+    def num_gates(self):
+        return len(self._gates)
+
+    def ket_site_ind(self, i):
+        """Get the site index for the given qubit."""
+        return self._ket_site_ind_id.format(i)
+
+    def bra_site_ind(self, i):
+        """Get the 'bra' site index for the given qubit, if forming an operator."""
+        return self._bra_site_ind_id.format(i)
+
+    def gate_tag(self, g):
+        """Get the tag for the given gate, indexed linearly."""
+        return self._gate_tag_id.format(g)
+
+    def round_tag(self, r):
+        """Get the tag for the given round (/layer)."""
+        return self._round_tag_id.format(r)
+
     def _init_state(self, N, dtype="complex128"):
         return TN_from_sites_computational_state(
             site_map={i: "0" for i in range(N)}, dtype=dtype
         )
 
     def _apply_gate(self, gate, tags=None, **gate_opts):
-        """Apply a ``Gate`` to this ``Circuit``."""
+        """Apply a ``Gate`` to this ``Circuit``. This is the main method that
+        all calls to apply a gate should go through.
+
+        Parameters
+        ----------
+        gate : Gate
+            The gate to apply.
+        tags : str or sequence of str, optional
+            Tags to add to the gate tensor(s).
+        """
         tags = tags_to_oset(tags)
-        tags.add(f"GATE_{len(self.gates)}")
-        if gate.round is not None:
-            tags.add(f"ROUND_{gate.round}")
-        if gate.tag is not None:
+        if self.tag_gate_numbers:
+            tags.add(self.gate_tag(self.num_gates))
+        if self.tag_gate_rounds and (gate.round is not None):
+            tags.add(self.round_tag(gate.round))
+        if self.tag_gate_labels and (gate.tag is not None):
             tags.add(gate.tag)
 
         # overide any default gate opts
         opts = {**self.gate_opts, **gate_opts}
 
         if gate.controls:
+            # handle extra (low-rank) control structure
             apply_controlled_gate(self._psi, gate, tags=tags, **opts)
+
         elif gate.special:
             # these are specified as a general function
             SPECIAL_GATES[gate.label](
                 self._psi, *gate.params, *gate.qubits, **opts
             )
+
         else:
+            # gate supplied as a matrix/tensor
+            G = gate.array
+            if self.to_backend is not None:
+                key = id(G)
+                if key not in self._backend_gate_cache:
+                    self._backend_gate_cache[key] = self.to_backend(G)
+                G = self._backend_gate_cache[key]
+
             # apply the gate to the TN!
-            self._psi.gate_(gate.array, gate.qubits, tags=tags, **opts)
+            self._psi.gate_(G, gate.qubits, tags=tags, **opts)
 
         # keep track of the gates applied
-        self.gates.append(gate)
+        self._gates.append(gate)
 
     def apply_gate(
         self,
@@ -1558,7 +1851,7 @@ class Circuit:
         qubits=None,
         controls=None,
         gate_round=None,
-        parametrize=False,
+        parametrize=None,
         **gate_opts,
     ):
         """Apply a single gate to this tensor network quantum circuit. If
@@ -1605,23 +1898,30 @@ class Circuit:
         )
         self._apply_gate(gate, **gate_opts)
 
-    def apply_gate_raw(self, U, where, gate_round=None, **gate_opts):
+    def apply_gate_raw(
+        self, U, where, controls=None, gate_round=None, **gate_opts
+    ):
         """Apply the raw array ``U`` as a gate on qubits in ``where``. It will
         be assumed to be unitary for the sake of computing reverse lightcones.
         """
-        gate = Gate.from_raw(U, where, gate_round)
+        gate = Gate.from_raw(U, where, controls=controls, round=gate_round)
         self._apply_gate(gate, **gate_opts)
 
-    def apply_gates(self, gates, **gate_opts):
+    def apply_gates(self, gates, progbar=False, **gate_opts):
         """Apply a sequence of gates to this tensor network quantum circuit.
 
         Parameters
         ----------
-        gates : list[list[str]]
+        gates : Sequence[Gate] or Sequence[Tuple]
             The sequence of gates to apply.
         gate_opts
             Supplied to :meth:`~quimb.tensor.circuit.Circuit.apply_gate`.
         """
+        if progbar:
+            from ..utils import progbar as _progbar
+
+            gates = _progbar(gates)
+
         for gate in gates:
             if isinstance(gate, Gate):
                 self._apply_gate(gate, **gate_opts)
@@ -2083,7 +2383,7 @@ class Circuit:
 
         lightcone_tags = []
 
-        for i, gate in reversed(tuple(enumerate(self.gates))):
+        for i, gate in reversed(tuple(enumerate(self._gates))):
             if gate.label == "IDEN":
                 continue
             elif gate.controls:
@@ -2091,7 +2391,7 @@ class Circuit:
                 # elsewhere to make sure tensors aren't then missing
                 regs = {*gate.controls, *gate.qubits}
                 if regs & cone:
-                    lightcone_tags.append(f"GATE_{i}")
+                    lightcone_tags.append(self.gate_tag(i))
                     cone |= regs
             elif gate.label == "SWAP":
                 i, j = gate.qubits
@@ -2108,7 +2408,7 @@ class Circuit:
             else:
                 regs = set(gate.qubits)
                 if regs & cone:
-                    lightcone_tags.append(f"GATE_{i}")
+                    lightcone_tags.append(self.gate_tag(i))
                     cone |= regs
 
         # initial state is always part of the lightcone
@@ -2156,15 +2456,17 @@ class Circuit:
 
         return psi_lc
 
+    def clear_storage(self):
+        """Clear all cached data."""
+        self._storage.clear()
+        self._sampled_conditionals.clear()
+        self._marginal_storage_size = 0
+        self._sample_n_gates = self.num_gates
+
     def _maybe_init_storage(self):
         # clear/create the cache if circuit has changed
-        if self._sample_n_gates != len(self.gates):
-            self._sample_n_gates = len(self.gates)
-
-            # storage
-            self._storage.clear()
-            self._sampled_conditionals.clear()
-            self._marginal_storage_size = 0
+        if self._sample_n_gates != self.num_gates:
+            self.clear_storage()
 
     def get_psi_simplified(
         self, seq="ADCRS", atol=1e-12, equalize_norms=False
@@ -3568,8 +3870,8 @@ class Circuit:
         tn : TensorNetwork
             The tensor network to find the updated parameters from.
         """
-        for i, gate in enumerate(self.gates):
-            tag = f"GATE_{i}"
+        for i, gate in enumerate(self._gates):
+            tag = self.gate_tag(i)
             t = tn[tag]
 
             # sanity check that tensor(s) `t` correspond to the correct gate
@@ -3585,7 +3887,7 @@ class Circuit:
                 self._psi[tag].params = t.params
 
                 # update the circuit's gate record
-                self.gates[i] = Gate(
+                self._gates[i] = Gate(
                     label=gate.label,
                     params=t.params,
                     qubits=gate.qubits,
@@ -3593,9 +3895,7 @@ class Circuit:
                     parametrize=True,
                 )
 
-    @property
-    def num_gates(self):
-        return len(self.gates)
+        self.clear_storage()
 
     def __repr__(self):
         r = "<Circuit(n={}, num_gates={}, gate_opts={})>"
@@ -3607,22 +3907,112 @@ class CircuitMPS(Circuit):
     you think the circuit will not build up much entanglement, or you just want
     to keep a rigorous handle on how much entanglement is present, this can
     be useful.
+
+    Parameters
+    ----------
+    N : int, optional
+        The number of qubits in the circuit.
+    psi0 : TensorNetwork1DVector, optional
+        The initial state, assumed to be ``|00000....0>`` if not given. The
+        state is always copied and the tag ``PSI0`` added.
+    max_bond : int, optional
+        The maximum bond dimension to truncate to when applying gates, if any.
+        This is simply a shortcut for setting ``gate_opts['max_bond']``.
+    cutoff : float, optional
+        The singular value cutoff to use when truncating the state.
+        This is simply a shortcut for setting ``gate_opts['cutoff']``.
+    gate_opts : dict, optional
+        Default options to pass to each gate, for example, "max_bond" and
+        "cutoff" etc.
+    gate_contract : str, optional
+        The default method for applying gates. Relevant MPS options are:
+
+        - ``'auto-mps'``: automatically choose a method that maintains the
+          MPS form (default). This uses ``'swap+split'`` for 2-qubit gates
+          and ``'nonlocal'`` for 3+ qubit gates.
+        - ``'swap+split'``: swap nonlocal qubits to be next to each other,
+          before applying the gate, then swapping them back
+        - ``'nonlocal'``: turn the gate into a potentially nonlocal (sub) MPO
+          and apply it directly. See :func:`tensor_network_1d_compress`.
+
+    circuit_opts
+        Supplied to :class:`~quimb.tensor.circuit.Circuit`.
+
+    Attributes
+    ----------
+    psi : MatrixProductState
+        The current state of the circuit, always in MPS form.
+
+    Examples
+    --------
+
+    Create a circuit object that always uses the "nonlocal" method for
+    contracting in gates, and the "dm" compression method within that, using
+    a large cutoff and maximum bond dimension::
+
+        circ = qtn.CircuitMPS(
+            N=56,
+            gate_opts=dict(
+                contract="nonlocal",
+                method="dm",
+                max_bond=1024,
+                cutoff=1e-3,
+            )
+        )
+
     """
 
     def __init__(
         self,
         N=None,
+        *,
         psi0=None,
+        max_bond=None,
+        cutoff=1e-10,
         gate_opts=None,
-        gate_contract="swap+split",
+        gate_contract="auto-mps",
         **circuit_opts,
     ):
         gate_opts = ensure_dict(gate_opts)
         gate_opts.setdefault("contract", gate_contract)
+        gate_opts.setdefault("propagate_tags", False)
+        gate_opts.setdefault("max_bond", max_bond)
+        gate_opts.setdefault("cutoff", cutoff)
+        # this is used to pass around the canonical form
+        gate_opts.setdefault("info", {})
+
+        circuit_opts.setdefault("tag_gate_numbers", False)
+        circuit_opts.setdefault("tag_gate_rounds", False)
+        circuit_opts.setdefault("tag_gate_labels", False)
+
         super().__init__(N, psi0, gate_opts, **circuit_opts)
 
     def _init_state(self, N, dtype="complex128"):
         return MPS_computational_state("0" * N, dtype=dtype)
+
+    def apply_gates(self, gates, progbar=False, **gate_opts):
+        if progbar:
+            from ..utils import progbar as _progbar
+
+            gates = tuple(gates)
+            gates = _progbar(gates, total=len(gates))
+            gates.set_description(
+                f"max_bond={self._psi.max_bond()}, "
+                f"error~={self.error_estimate():.3g}"
+            )
+
+        for gate in gates:
+            if isinstance(gate, Gate):
+                self._apply_gate(gate, **gate_opts)
+            else:
+                self.apply_gate(*gate, **gate_opts)
+
+            if progbar and (gate.total_qubit_count >= 2):
+                # these don't change for single qubit gates
+                gates.set_description(
+                    f"max_bond={self._psi.max_bond()}, "
+                    f"error~={self.error_estimate():.3g}"
+                )
 
     @property
     def psi(self):
@@ -3632,8 +4022,7 @@ class CircuitMPS(Circuit):
     @property
     def uni(self):
         raise ValueError(
-            "You can't extract the circuit unitary "
-            "TN from a ``CircuitMPS``."
+            "You can't extract the circuit unitary TN from a ``CircuitMPS``."
         )
 
     def calc_qubit_ordering(self, qubits=None):
@@ -3648,6 +4037,118 @@ class CircuitMPS(Circuit):
         is not meaningful.
         """
         return self.psi
+
+    def fidelity_estimate(self):
+        r"""Estimate the fidelity of the current state based on its norm, which
+        tracks how much the state has been truncated:
+
+        .. math::
+
+            \tilde{F} =
+            \left| \langle \psi | \psi \rangle \right|^2
+            \approx
+            \left|\langle \psi_\mathrm{ideal} | \psi \rangle\right|^2
+
+        See Also
+        --------
+        error_estimate
+        """
+        cur_orthog = self.gate_opts["info"].get("cur_orthog", None)
+
+        if cur_orthog is None:
+            return abs(self._psi.norm()) ** 2
+
+        cmin, cmax = cur_orthog
+        return abs(self._psi[cmin : cmax + 1].norm(tags=all)) ** 2
+
+    def error_estimate(self):
+        r"""Estimate the error in the current state based on the norm of the
+        discarded part of the state:
+
+        .. math::
+
+            \epsilon = 1 - \tilde{F}
+
+        See Also
+        --------
+        fidelity_estimate
+        """
+        return 1 - self.fidelity_estimate()
+
+
+class CircuitPermMPS(CircuitMPS):
+    """Quantum circuit simulation keeping the state always in an MPS form, but
+    lazily tracking the qubit ordering rather than 'swapping back' qubits after
+    applying non-local gates. This can be useful for circuits with no
+    expectation of locality. The qubit ordering is always tracked in the
+    attribute ``qubits``. The ``psi`` attribute returns the TN with the sites
+    reindexed and retagged according to the current qubit ordering, meaning it
+    is no longer an MPS. Use `circ.get_psi_unordered()` to get the unpermuted
+    MPS and use `circ.qubits` to get the current qubit ordering if you prefer.
+    """
+
+    def __init__(
+        self,
+        N=None,
+        psi0=None,
+        gate_opts=None,
+        gate_contract="swap+split",
+        **circuit_opts,
+    ):
+        gate_opts = ensure_dict(gate_opts)
+        gate_opts.setdefault("contract", gate_contract)
+        # this is used to pass around the canonical form
+        gate_opts.setdefault("info", {})
+        super().__init__(N, psi0=psi0, gate_opts=gate_opts, **circuit_opts)
+        # keep track of the current qubit ordering
+        self.qubits = list(range(self.N))
+
+    def _apply_gate(self, gate, tags=None, **gate_opts):
+        # first translate gate qubits to their current 'physical' location
+        qubits = gate.qubits
+        phys_sites = [self.qubits.index(q) for q in qubits]
+        gate = gate.copy_with(qubits=phys_sites)
+
+        # if the gate is non-local, account for swap (without swap back)
+        if len(phys_sites) == 2:
+            i, j = sorted(phys_sites)
+            q = self.qubits.pop(j)
+            self.qubits.insert(i + 1, q)
+            gate_opts["swap_back"] = False
+
+        super()._apply_gate(gate, tags=tags, **gate_opts)
+
+    def calc_qubit_ordering(self, qubits=None):
+        """Given by the current qubit permutation."""
+        if qubits is None:
+            return tuple(self.qubits)
+        else:
+            return tuple(sorted(qubits, key=self.qubits.index))
+
+    def get_psi_unordered(self):
+        """Return the MPS representing the state but without reordering the
+        sites.
+        """
+        return self._psi.copy()
+
+    @property
+    def psi(self):
+        # need to reindex and retag the MPS
+        psi = self._psi.copy()
+        psi.view_as_(TensorNetworkGenVector)
+        psi.reindex_(
+            {
+                psi.site_ind(i): psi.site_ind(q)
+                for i, q in enumerate(self.qubits)
+            }
+        )
+        psi.retag_(
+            {
+                psi.site_tag(i): psi.site_tag(q)
+                for i, q in enumerate(self.qubits)
+            }
+        )
+        return psi
 
 
 class CircuitDense(Circuit):
@@ -3670,8 +4171,7 @@ class CircuitDense(Circuit):
     @property
     def uni(self):
         raise ValueError(
-            "You can't extract the circuit unitary "
-            "TN from a ``CircuitDense``."
+            "You can't extract the circuit unitary TN from a ``CircuitDense``."
         )
 
     def calc_qubit_ordering(self, qubits=None):

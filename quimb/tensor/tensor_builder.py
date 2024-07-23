@@ -28,6 +28,7 @@ from .tensor_2d_tebd import LocalHam2D
 from .tensor_3d import TensorNetwork3D, gen_3d_bonds, gen_3d_plaquettes
 from .tensor_3d_tebd import LocalHam3D
 from .tensor_arbgeom import (
+    create_lazy_edge_map,
     TensorNetworkGen,
     TensorNetworkGenOperator,
     TensorNetworkGenVector,
@@ -2068,14 +2069,40 @@ def classical_ising_T_matrix(
     return array_contract(arrays, inputs, out)
 
 
+def parse_j_coupling_to_function(j):
+    """Parse the ``j`` argument to a function that can be called to get the
+    coupling strength between two nodes. The input can be a constant, dict or
+    function.
+    """
+    if callable(j):
+        return j
+
+    elif isinstance(j, dict):
+
+        def j_factory(node_a, node_b):
+            try:
+                return j[node_a, node_b]
+            except KeyError:
+                return j[node_b, node_a]
+
+        return j_factory
+    else:
+
+        def j_factory(node_a, node_b):
+            return j
+
+        return j_factory
+
+
 def HTN2D_classical_ising_partition_function(
     Lx,
     Ly,
     beta,
     h=0.0,
     j=1.0,
-    ind_id="s{},{}",
     cyclic=False,
+    ind_id="s{},{}",
+    site_tag_id="I{},{}",
 ):
     """Hyper tensor network representation of the 2D classical ising model
     partition function. The indices will be shared by 4 or 5 tensors depending
@@ -2103,6 +2130,10 @@ def HTN2D_classical_ising_partition_function(
     ind_id : str, optional
         How to label the indices i.e. ``ind_id.format(i, j)``, each of which
         corresponds to a single classical spin.
+    site_tag_id : str, optional
+        How to label the site tags, note that in the hyper tensor network
+        representation each tensor will have two site tags for the two sites it
+        connects.
 
     Returns
     -------
@@ -2117,18 +2148,10 @@ def HTN2D_classical_ising_partition_function(
     except TypeError:
         cyclic_x = cyclic_y = cyclic
 
-    if callable(j):
-        j_factory = j
-    elif isinstance(j, dict):
+    j_factory = parse_j_coupling_to_function(j)
 
-        def j_factory(node_a, node_b):
-            return j[node_a, node_b]
-    else:
+    tn = TensorNetwork()
 
-        def j_factory(node_a, node_b):
-            return j
-
-    ts = []
     for ni, nj in itertools.product(range(Lx), range(Ly)):
         if ni < Lx - 1 or cyclic_x:
             node_a, node_b = (ni, nj), ((ni + 1) % Lx, nj)
@@ -2136,7 +2159,8 @@ def HTN2D_classical_ising_partition_function(
             data = classical_ising_S_matrix(
                 beta=beta, j=j_factory(node_a, node_b)
             )
-            ts.append(Tensor(data, inds=inds))
+            tags = (site_tag_id.format(*node_a), site_tag_id.format(*node_b))
+            tn |= Tensor(data, inds=inds, tags=tags)
 
         if nj < Ly - 1 or cyclic_y:
             node_a, node_b = (ni, nj), (ni, (nj + 1) % Ly)
@@ -2144,35 +2168,16 @@ def HTN2D_classical_ising_partition_function(
             data = classical_ising_S_matrix(
                 beta=beta, j=j_factory(node_a, node_b)
             )
-            ts.append(Tensor(data, inds=inds))
+            tags = (site_tag_id.format(*node_a), site_tag_id.format(*node_b))
+            tn |= Tensor(data, inds=inds, tags=tags)
 
         if h != 0.0:
+            inds = (ind_id.format(ni, nj),)
             data = classical_ising_H_matrix(beta=beta, h=float(h))
-            ts.append(Tensor(data, inds=(ind_id.format(ni, nj),)))
+            tags = (site_tag_id.format(ni, nj),)
+            tn |= Tensor(data, inds=inds)
 
-    return TensorNetwork(ts)
-
-
-def parse_j_coupling_to_function(j):
-    """Parse the ``j`` argument to a function that can be called to get the
-    coupling strength between two nodes. The input can be a constant, dict or
-    function.
-    """
-    if callable(j):
-        return j
-
-    elif isinstance(j, dict):
-
-        def j_factory(node_a, node_b):
-            return j[node_a, node_b]
-
-        return j_factory
-    else:
-
-        def j_factory(node_a, node_b):
-            return j
-
-        return j_factory
+    return tn
 
 
 def HTN3D_classical_ising_partition_function(
@@ -2184,6 +2189,7 @@ def HTN3D_classical_ising_partition_function(
     h=0.0,
     cyclic=False,
     ind_id="s{},{},{}",
+    site_tag_id="I{},{},{}",
 ):
     """Hyper tensor network representation of the 3D classical ising model
     partition function. The indices will be shared by 6 or 7 tensors depending
@@ -2213,6 +2219,10 @@ def HTN3D_classical_ising_partition_function(
     ind_id : str, optional
         How to label the indices i.e. ``ind_id.format(i, j, k)``, each of which
         corresponds to a single classical spin.
+    site_tag_id : str, optional
+        How to label the site tags, note that in the hyper tensor network
+        representation each tensor will have two site tags for the two sites it
+        connects.
 
     Returns
     -------
@@ -2229,7 +2239,8 @@ def HTN3D_classical_ising_partition_function(
 
     j_factory = parse_j_coupling_to_function(j)
 
-    ts = []
+    tn = TensorNetwork()
+
     for ni, nj, nk in itertools.product(range(Lx), range(Ly), range(Lz)):
         if ni < Lx - 1 or cyclic_x:
             node_a, node_b = (ni, nj, nk), ((ni + 1) % Lx, nj, nk)
@@ -2237,7 +2248,8 @@ def HTN3D_classical_ising_partition_function(
             data = classical_ising_S_matrix(
                 beta=beta, j=j_factory(node_a, node_b)
             )
-            ts.append(Tensor(data, inds=inds))
+            tags = (site_tag_id.format(*node_a), site_tag_id.format(*node_b))
+            tn |= Tensor(data, inds=inds, tags=tags)
 
         if nj < Ly - 1 or cyclic_y:
             node_a, node_b = (ni, nj, nk), (ni, (nj + 1) % Ly, nk)
@@ -2245,7 +2257,8 @@ def HTN3D_classical_ising_partition_function(
             data = classical_ising_S_matrix(
                 beta=beta, j=j_factory(node_a, node_b)
             )
-            ts.append(Tensor(data, inds=inds))
+            tags = (site_tag_id.format(*node_a), site_tag_id.format(*node_b))
+            tn |= Tensor(data, inds=inds, tags=tags)
 
         if nk < Lz - 1 or cyclic_z:
             node_a, node_b = (ni, nj, nk), (ni, nj, (nk + 1) % Lz)
@@ -2253,13 +2266,16 @@ def HTN3D_classical_ising_partition_function(
             data = classical_ising_S_matrix(
                 beta=beta, j=j_factory(node_a, node_b)
             )
-            ts.append(Tensor(data, inds=inds))
+            tags = (site_tag_id.format(*node_a), site_tag_id.format(*node_b))
+            tn |= Tensor(data, inds=inds, tags=tags)
 
         if h != 0.0:
+            inds = (ind_id.format(ni, nj, nk),)
             data = classical_ising_H_matrix(beta=beta, h=float(h))
-            ts.append(Tensor(data, inds=(ind_id.format(ni, nj, nk),)))
+            tags = (site_tag_id.format(ni, nj, nk),)
+            tn |= Tensor(data, inds=inds, tags=tags)
 
-    return TensorNetwork(ts)
+    return tn
 
 
 def TN2D_classical_ising_partition_function(
@@ -2617,6 +2633,8 @@ def TN_classical_partition_function_from_edges(
     h=0.0,
     site_tag_id="I{}",
     bond_ind_id="b{},{}",
+    outputs=(),
+    ind_id="s{}",
 ):
     """Build a regular tensor network representation of a classical ising model
     partition function by specifying graph edges. There will be a single
@@ -2653,23 +2671,28 @@ def TN_classical_partition_function_from_edges(
     to_contract = collections.defaultdict(list)
     ts = []
     for node_a, node_b in gen_unique_edges(edges):
+        # the variable indices (unless the node is
+        # an output, these will be contracted)
+        ix_a = ind_id.format(node_a)
+        ix_b = ind_id.format(node_b)
+
         j_ab = j_factory(node_a, node_b)
         bond_ab = bond_ind_id.format(node_a, node_b)
 
         # left tensor factor
         data = classical_ising_sqrtS_matrix(beta=beta, j=j_ab, asymm="l")
-        inds = [f"s{node_a}", bond_ab]
+        inds = [ix_a, bond_ab]
         tags = [site_tag_id.format(node_a)]
         ts.append(Tensor(data=data, inds=inds, tags=tags))
 
         # right tensor factor
         data = classical_ising_sqrtS_matrix(beta=beta, j=j_ab, asymm="r")
-        inds = [bond_ab, f"s{node_b}"]
+        inds = [bond_ab, ix_b]
         tags = [site_tag_id.format(node_b)]
         ts.append(Tensor(data=data, inds=inds, tags=tags))
 
-        to_contract[f"s{node_a}"].append(bond_ab)
-        to_contract[f"s{node_b}"].append(bond_ab)
+        to_contract[ix_a].append(bond_ab)
+        to_contract[ix_b].append(bond_ab)
 
     sites = tuple(sorted(set(concat(edges))))
 
@@ -2683,10 +2706,14 @@ def TN_classical_partition_function_from_edges(
 
         for node in sites:
             data = classical_ising_H_matrix(beta, h=float(h_factory(node)))
-            inds = [f"s{node}"]
+            inds = [ind_id.format(node)]
             tags = [site_tag_id.format(node)]
             ts.append(Tensor(data=data, inds=inds, tags=tags))
-            to_contract[f"s{node}"].extend(())
+            to_contract[ind_id.format(node)].extend(())
+
+    for node in outputs:
+        ix = ind_id.format(node)
+        to_contract[ix].append(ix)
 
     tn = TensorNetwork(ts)
 
@@ -3527,10 +3554,12 @@ def HTN_random_ksat(
     )
 
 
-def TN1D_matching(tn, max_bond, site_tags=None, dtype=None, **randn_opts):
-    """Create a 1D tensor network with the same outer indices as ``tn`` but
+def TN_matching(
+    tn, max_bond, site_tags=None, fill_fn=None, dtype=None, **randn_opts
+):
+    """Create a tensor network with the same outer indices as ``tn`` but
     with a single tensor per site with bond dimension ``max_bond`` between
-    joining each site. Generally to be used as an initial guess for fitting.
+    each connected site. Generally to be used as an initial guess for fitting.
 
     Parameters
     ----------
@@ -3553,44 +3582,44 @@ def TN1D_matching(tn, max_bond, site_tags=None, dtype=None, **randn_opts):
     -------
     TensorNetwork
     """
-    if site_tags is None:
-        site_tags = tn.site_tags
+    _, neighbors = create_lazy_edge_map(tn, site_tags)
 
-    if dtype is None:
-        dtype = tn.dtype
+    if fill_fn is None:
+        if dtype is None:
+            try:
+                dtype = tn.dtype
+            except AttributeError:
+                # for arrays with no dtype - e.g. autoray.lazy
+                dtype = "float64"
+        fill_fn = get_rand_fill_fn(dtype=dtype, **randn_opts)
 
-    tn_fit = TensorNetwork()
-
+    tn_match = TensorNetwork()
     all_outer_ix = set(tn.outer_inds())
     bonds = collections.defaultdict(rand_uuid)
 
-    for i, site in enumerate(site_tags):
+    for site, other_sites in neighbors.items():
         # get local network at site
         tni = tn.select(site)
         # get all local indices which as also outer indices
-        loix = tuple(ix for ix in tni.ind_map if ix in all_outer_ix)
+        loix = tuple(ix for ix in tni.outer_inds() if ix in all_outer_ix)
         # also inherit all local tags
         ltags = tni.tags
 
+        # add virtual bonds
         shape = []
         inds = []
-        # add bond dimensions
-        if i > 0:
+        for other_site in other_sites:
             shape.append(max_bond)
-            inds.append(bonds[i - 1, i])
-        if i < len(site_tags) - 1:
-            shape.append(max_bond)
-            inds.append(bonds[i, i + 1])
+            inds.append(bonds[frozenset([site, other_site])])
+
         # add physical/outer dimensions
         shape.extend(map(tn.ind_size, loix))
         inds.extend(loix)
 
-        tn_fit |= rand_tensor(
-            shape=shape, inds=inds, tags=ltags, dtype=dtype, **randn_opts
-        )
+        tn_match |= Tensor(data=fill_fn(shape), inds=inds, tags=ltags)
 
     # finally cast the new network as the same type as the original
-    return tn_fit.view_like_(tn)
+    return tn_match.view_like_(tn)
 
 
 # --------------------------------------------------------------------------- #
@@ -3605,8 +3634,10 @@ def MPS_rand_state(
     phys_dim=2,
     normalize=True,
     cyclic=False,
-    dtype="float64",
     dist="normal",
+    loc=0.0,
+    scale=1.0,
+    dtype="float64",
     trans_invar=False,
     **mps_opts,
 ):
@@ -3625,6 +3656,12 @@ def MPS_rand_state(
     cyclic : bool, optional
         Generate a MPS with periodic boundary conditions or not, default is
         open boundary conditions.
+    dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
+        Type of random number to generate, defaults to 'normal'.
+    loc : float, optional
+        An additive offset to add to the random numbers.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
     dtype : {float, complex} or numpy dtype, optional
         Data type of the tensor network.
     trans_invar : bool (optional)
@@ -3633,6 +3670,8 @@ def MPS_rand_state(
     mps_opts
         Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductState`.
     """
+    randn_opts = {"dist": dist, "loc": loc, "scale": scale, "dtype": dtype}
+
     if trans_invar:
         if not cyclic:
             raise ValueError(
@@ -3640,11 +3679,7 @@ def MPS_rand_state(
                 "boundary conditions."
             )
         array = sensibly_scale(
-            randn(
-                shape=(bond_dim, bond_dim, phys_dim),
-                dtype=dtype,
-                dist=dist,
-            )
+            randn(shape=(bond_dim, bond_dim, phys_dim), **randn_opts)
         )
 
         def fill_fn(shape):
@@ -3653,7 +3688,7 @@ def MPS_rand_state(
     else:
 
         def fill_fn(shape):
-            return sensibly_scale(randn(shape, dtype=dtype, dist=dist))
+            return sensibly_scale(randn(shape, **randn_opts))
 
     mps = MatrixProductState.from_fill_fn(
         fill_fn,
@@ -3665,13 +3700,9 @@ def MPS_rand_state(
     )
 
     if normalize == "left":
-        if cyclic:
-            raise ValueError("Cannot left normalize cyclic MPS.")
-        mps.left_canonize(normalize=True)
+        mps.left_canonicalize_(normalize=True)
     elif normalize == "right":
-        if cyclic:
-            raise ValueError("Cannot right normalize cyclic MPS.")
-        mps.left_canonize(normalize=True)
+        mps.right_canonicalize_(normalize=True)
     elif normalize:
         mps.normalize()
 
@@ -3921,7 +3952,9 @@ def MPS_sampler(L, dtype=complex, squeeze=True, **mps_opts):
 # --------------------------------------------------------------------------- #
 
 
-def MPO_identity(L, phys_dim=2, dtype="float64", cyclic=False, **mpo_opts):
+def MPO_identity(
+    L, sites=None, phys_dim=2, dtype="float64", cyclic=False, **mpo_opts
+):
     """Generate an identity MPO of size ``L``.
 
     Parameters
@@ -3941,29 +3974,43 @@ def MPO_identity(L, phys_dim=2, dtype="float64", cyclic=False, **mpo_opts):
     II = np.identity(phys_dim, dtype=dtype)
     cyc_dim = (1,) if cyclic else ()
 
-    def gen_arrays():
-        yield II.reshape(*cyc_dim, 1, phys_dim, phys_dim)
-        for _ in range(L - 2):
-            yield II.reshape(1, 1, phys_dim, phys_dim)
-        yield II.reshape(1, *cyc_dim, phys_dim, phys_dim)
+    if sites is None:
+        si = 0
+        sf = L - 1
+        num_middle = L - 2
+    else:
+        sites = tuple(sites)
+        si = sites[0]
+        sf = sites[-1]
+        num_middle = len(sites) - 2
+        mpo_opts["sites"] = sites
 
-    return MatrixProductOperator(gen_arrays(), **mpo_opts)
+    if si == sf:
+        raise ValueError(
+            "Identity MPO cannot have the same start and end site."
+        )
+
+    IIl = reshape(II, (*cyc_dim, 1, phys_dim, phys_dim))
+    IIm = reshape(II, (1, 1, phys_dim, phys_dim))
+    IIr = reshape(II, (1, *cyc_dim, phys_dim, phys_dim))
+
+    arrays = [IIl] + [IIm] * num_middle + [IIr]
+
+    return MatrixProductOperator(arrays, **mpo_opts)
 
 
 def MPO_identity_like(mpo, **mpo_opts):
     """Return an identity matrix operator with the same physical index and
     inds/tags as ``mpo``.
     """
-    return MPO_identity(
-        L=mpo.L,
-        phys_dim=mpo.phys_dim(),
-        dtype=mpo.dtype,
-        site_tag_id=mpo.site_tag_id,
-        cyclic=mpo.cyclic,
-        upper_ind_id=mpo.upper_ind_id,
-        lower_ind_id=mpo.lower_ind_id,
-        **mpo_opts,
-    )
+    mpo_opts.setdefault("L", mpo.L)
+    mpo_opts.setdefault("phys_dim", mpo.phys_dim())
+    mpo_opts.setdefault("dtype", mpo.dtype)
+    mpo_opts.setdefault("site_tag_id", mpo.site_tag_id)
+    mpo_opts.setdefault("cyclic", mpo.cyclic)
+    mpo_opts.setdefault("upper_ind_id", mpo.upper_ind_id)
+    mpo_opts.setdefault("lower_ind_id", mpo.lower_ind_id)
+    return MPO_identity(**mpo_opts)
 
 
 def MPO_zeros(L, phys_dim=2, dtype="float64", cyclic=False, **mpo_opts):
@@ -3987,15 +4034,13 @@ def MPO_zeros(L, phys_dim=2, dtype="float64", cyclic=False, **mpo_opts):
     -------
     MatrixProductOperator
     """
-    cyc_dim = (1,) if cyclic else ()
 
-    def gen_arrays():
-        yield np.zeros((*cyc_dim, 1, phys_dim, phys_dim), dtype=dtype)
-        for _ in range(L - 2):
-            yield np.zeros((1, 1, phys_dim, phys_dim), dtype=dtype)
-        yield np.zeros((1, *cyc_dim, phys_dim, phys_dim), dtype=dtype)
+    def fill_fn(shape):
+        return np.zeros(shape, dtype=dtype)
 
-    return MatrixProductOperator(gen_arrays(), **mpo_opts)
+    return MatrixProductOperator.from_fill_fn(
+        fill_fn, L=L, bond_dim=1, phys_dim=phys_dim, cyclic=cyclic, **mpo_opts
+    )
 
 
 def MPO_zeros_like(mpo, **mpo_opts):
@@ -4011,16 +4056,14 @@ def MPO_zeros_like(mpo, **mpo_opts):
     -------
     MatrixProductOperator
     """
-    return MPO_zeros(
-        L=mpo.L,
-        phys_dim=mpo.phys_dim(),
-        dtype=mpo.dtype,
-        site_tag_id=mpo.site_tag_id,
-        upper_ind_id=mpo.upper_ind_id,
-        cyclic=mpo.cyclic,
-        lower_ind_id=mpo.lower_ind_id,
-        **mpo_opts,
-    )
+    mpo_opts.setdefault("L", mpo.L)
+    mpo_opts.setdefault("phys_dim", mpo.phys_dim())
+    mpo_opts.setdefault("dtype", mpo.dtype)
+    mpo_opts.setdefault("site_tag_id", mpo.site_tag_id)
+    mpo_opts.setdefault("cyclic", mpo.cyclic)
+    mpo_opts.setdefault("upper_ind_id", mpo.upper_ind_id)
+    mpo_opts.setdefault("lower_ind_id", mpo.lower_ind_id)
+    return MPO_zeros(**mpo_opts)
 
 
 def MPO_product_operator(
@@ -4066,6 +4109,8 @@ def MPO_rand(
     herm=False,
     dtype="float64",
     dist="normal",
+    loc=0.0,
+    scale=1.0,
     **mpo_opts,
 ):
     """Generate a random matrix product state.
@@ -4087,30 +4132,40 @@ def MPO_rand(
         Data type of the tensor network.
     dist : {'normal', 'uniform', 'rademacher', 'exp'}, optional
         Type of random number to generate, defaults to 'normal'.
+    loc : float, optional
+        An additive offset to add to the random numbers.
+    scale : float, optional
+        A multiplicative factor to scale the random numbers by.
     herm : bool, optional
         Whether to make the matrix hermitian (or symmetric if real) or not.
     mpo_opts
         Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductOperator`.
     """
-    cyc_shp = (bond_dim,) if cyclic else ()
+    base_fill_fn = get_rand_fill_fn(
+        dtype=dtype, dist=dist, loc=loc, scale=scale
+    )
 
-    shapes = [
-        (*cyc_shp, bond_dim, phys_dim, phys_dim),
-        *((bond_dim, bond_dim, phys_dim, phys_dim),) * (L - 2),
-        (bond_dim, *cyc_shp, phys_dim, phys_dim),
-    ]
+    if not herm:
 
-    def gen_data(shape):
-        data = randn(shape, dtype=dtype, dist=dist)
-        if not herm:
-            return data
+        def fill_fn(shape):
+            return sensibly_scale(base_fill_fn(shape))
+    else:
 
-        trans = (0, 2, 1) if len(shape) == 3 else (0, 1, 3, 2)
-        return data + data.transpose(*trans).conj()
+        def fill_fn(shape):
+            data = base_fill_fn(shape)
+            trans = (0, 2, 1) if len(shape) == 3 else (0, 1, 3, 2)
+            data += data.transpose(*trans).conj()
+            return sensibly_scale(data)
 
-    arrays = map(sensibly_scale, map(gen_data, shapes))
-
-    rmpo = MatrixProductOperator(arrays, **mpo_opts)
+    rmpo = MatrixProductOperator.from_fill_fn(
+        fill_fn,
+        L=L,
+        bond_dim=bond_dim,
+        phys_dim=phys_dim,
+        cyclic=cyclic,
+        shape="lrud",
+        **mpo_opts,
+    )
 
     if normalize:
         rmpo /= (rmpo.H @ rmpo) ** 0.5
@@ -4412,7 +4467,6 @@ class SpinHam1D:
         lower_ind_id="b{}",
         site_tag_id="I{}",
         tags=None,
-        bond_name="",
     ):
         """Build an MPO instance of this spin hamiltonian of size ``L``. See
         also ``MatrixProductOperator``.
@@ -4468,7 +4522,6 @@ class SpinHam1D:
 
         return MatrixProductOperator(
             arrays=gen_tensors(),
-            bond_name=bond_name,
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
             site_tag_id=site_tag_id,

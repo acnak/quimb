@@ -525,22 +525,30 @@ class TestTensorFunctions:
         assert fn2 == pytest.approx(385.0)
         assert trc == pytest.approx(55.0)
 
-        tn2 = t.split("a", method="svd", cutoff=0.1, cutoff_mode="rsum2")
+        tn2 = t.split(
+            "a", method="svd", cutoff=0.1, renorm=True, cutoff_mode="rsum2"
+        )
         a_fn2 = tn2.H @ tn2
         assert qtn.bonds_size(*tn2) == 6
         assert a_fn2 == pytest.approx(fn2)
 
-        tn2 = t.split("a", method="svd", cutoff=40, cutoff_mode="sum2")
+        tn2 = t.split(
+            "a", method="svd", cutoff=40, renorm=True, cutoff_mode="sum2"
+        )
         a_fn2 = tn2.H @ tn2
         assert qtn.bonds_size(*tn2) == 6
         assert a_fn2 == pytest.approx(fn2)
 
-        tn1 = t.split("a", method="svd", cutoff=0.2, cutoff_mode="rsum1")
+        tn1 = t.split(
+            "a", method="svd", cutoff=0.2, renorm=True, cutoff_mode="rsum1"
+        )
         a_trc = tn1.trace("a", "b").real
         assert qtn.bonds_size(*tn1) == 6
         assert a_trc == pytest.approx(trc)
 
-        tn1 = t.split("a", method="svd", cutoff=11, cutoff_mode="sum1")
+        tn1 = t.split(
+            "a", method="svd", cutoff=11, renorm=True, cutoff_mode="sum1"
+        )
         a_trc = tn1.trace("a", "b").real
         assert qtn.bonds_size(*tn1) == 6
         assert a_trc == pytest.approx(trc)
@@ -561,14 +569,14 @@ class TestTensorFunctions:
         assert_allclose(real_svn, svn)
 
         # use tensor to left of bipartition
-        p.canonize(2)
+        p.canonicalize_(2)
         t1 = p["I2"]
         left_inds = set(t1.inds) - set(p["I3"].inds)
         svn = (t1).entropy(left_inds, method=method)
         assert_allclose(real_svn, svn)
 
         # use tensor to right of bipartition
-        p.canonize(3)
+        p.canonicalize_(3)
         t2 = p["I3"]
         left_inds = set(t2.inds) & set(p["I2"].inds)
         svn = (t2).entropy(left_inds, method=method)
@@ -1362,10 +1370,10 @@ class TestTensorNetwork:
         assert B1.shape == (4, 6)
         if absorb == "right":
             # assert A is isometric
-            assert A1.norm()**2 == pytest.approx(4)
+            assert A1.norm() ** 2 == pytest.approx(4)
         if absorb == "left":
             # assert B is isometric
-            assert B1.norm()**2 == pytest.approx(4)
+            assert B1.norm() ** 2 == pytest.approx(4)
         # compute the optimal fidelity
         d1 = (A1 @ B1).distance(AB)
         assert 0 < d1
@@ -1375,9 +1383,9 @@ class TestTensorNetwork:
         assert A2.shape == (3, 4, 4)
         assert B2.shape == (4, 6)
         if absorb == "right":
-            assert A2.norm()**2 == pytest.approx(4)
+            assert A2.norm() ** 2 == pytest.approx(4)
         if absorb == "left":
-            assert B2.norm()**2 == pytest.approx(4)
+            assert B2.norm() ** 2 == pytest.approx(4)
         d2 = (A2 @ B2).distance(AB)
         # reduced mode should also be optimal
         assert d2 == pytest.approx(d1)
@@ -1389,9 +1397,9 @@ class TestTensorNetwork:
         if absorb == "right":
             # A won't be canonical
             assert Ar.left_inds is None
-            assert Ar.norm()**2 != pytest.approx(4)
+            assert Ar.norm() ** 2 != pytest.approx(4)
         if absorb == "left":
-            assert Br.norm()**2 == pytest.approx(4)
+            assert Br.norm() ** 2 == pytest.approx(4)
         dr = (Ar @ Br).distance(AB)
         # right reduced mode should not be optimal
         assert dr > d1
@@ -1400,9 +1408,9 @@ class TestTensorNetwork:
         qtn.tensor_canonize_bond(Ar, Br, absorb="right")
         qtn.tensor_compress_bond(Ar, Br, reduced="right", **kws)
         if absorb == "right":
-            assert Ar.norm()**2 == pytest.approx(4)
+            assert Ar.norm() ** 2 == pytest.approx(4)
         if absorb == "left":
-            assert Br.norm()**2 == pytest.approx(4)
+            assert Br.norm() ** 2 == pytest.approx(4)
         dr = (Ar @ Br).distance(AB)
         assert dr == pytest.approx(d1)
 
@@ -1411,11 +1419,11 @@ class TestTensorNetwork:
         assert Al.shape == (3, 4, 4)
         assert Bl.shape == (4, 6)
         if absorb == "right":
-            assert Al.norm()**2 == pytest.approx(4)
+            assert Al.norm() ** 2 == pytest.approx(4)
         if absorb == "left":
             # B won't be canonical
             assert Bl.left_inds is None
-            assert Bl.norm()**2 != pytest.approx(4)
+            assert Bl.norm() ** 2 != pytest.approx(4)
         dl = (Al @ Bl).distance(AB)
         # left reduced mode should not be optimal
         assert dl > d1
@@ -1424,9 +1432,9 @@ class TestTensorNetwork:
         qtn.tensor_canonize_bond(Al, Bl, absorb="left")
         qtn.tensor_compress_bond(Al, Bl, reduced="left", **kws)
         if absorb == "right":
-            assert Al.norm()**2 == pytest.approx(4)
+            assert Al.norm() ** 2 == pytest.approx(4)
         if absorb == "left":
-            assert Bl.norm()**2 == pytest.approx(4)
+            assert Bl.norm() ** 2 == pytest.approx(4)
         dl = (Al @ Bl).distance(AB)
         assert dl == pytest.approx(d1)
 
@@ -1450,7 +1458,7 @@ class TestTensorNetwork:
         B.expand_ind("d", 10)
         tn = A | B
         assert A.shared_bond_size(B) == 10
-        tn.compress_between("T1", "T2", method=method)
+        tn.compress_between("T1", "T2", method=method, mode="basic")
         assert A.shared_bond_size(B) == 5
 
     @pytest.mark.parametrize("method", ["svd", "eig", "isvd", "svds", "rsvd"])
@@ -1458,7 +1466,7 @@ class TestTensorNetwork:
         k = MPS_rand_state(10, 7)
         k += k
         k /= 2
-        k.compress_all_(max_bond=7, method=method)
+        k.compress_all_(max_bond=7, method=method, mode="basic")
         assert k.max_bond() == 7
         assert_allclose(k.H @ k, 1.0)
 
@@ -1603,9 +1611,23 @@ class TestTensorNetwork:
         ta = qtn.rand_tensor((2, 2, 2), inds="abc", tags="A")
         tb = qtn.rand_tensor((2, 2, 2), inds="cde", tags="B")
         tn = ta | tb
-        tn.cut_bond('c', new_left_ind='l', new_right_ind='r')
-        assert ta.inds == ('a', 'b', 'l')
-        assert tb.inds == ('r', 'd', 'e')
+        tn.cut_bond("c", new_left_ind="l", new_right_ind="r")
+        assert ta.inds == ("a", "b", "l")
+        assert tb.inds == ("r", "d", "e")
+
+    def test_drape_bond_between(self):
+        tx = qtn.rand_tensor([2, 3, 4], ["a", "b", "c"], tags="X")
+        ty = qtn.rand_tensor([3, 4, 6], ["b", "d", "e"], tags="Y")
+        tz = qtn.rand_tensor([5], ["f"], tags="Z")
+        tn = tx | ty | tz
+        assert tn.num_indices == 6
+        assert len(tn.subgraphs()) == 2
+        te = tn.contract()
+        tn.drape_bond_between_("X", "Y", "Z")
+        assert tn.num_indices == 7
+        assert len(tn.subgraphs()) == 1
+        t = tn.contract()
+        assert t.distance_normalized(te) == pytest.approx(0.0, abs=1e-6)
 
     def test_draw(self):
         import matplotlib
@@ -1848,6 +1870,16 @@ class TestTensorNetwork:
         assert tn._outer_inds == oset(["k0", "k1", "k2", "b0", "b1", "b2"])
         assert tn.num_tensors == 4
         assert tn.num_indices == 9
+
+    def test_gen_inds_loops(self):
+        tn = qtn.TN2D_rand(3, 4, 2)
+        loops = tuple(tn.gen_inds_loops())
+        assert len(loops) == 6
+
+    def test_gen_inds_connected(self):
+        tn = qtn.TN2D_rand(3, 4, 2)
+        patches = tuple(tn.gen_inds_connected(2))
+        assert len(patches) == 34
 
 
 class TestTensorNetworkSimplifications:

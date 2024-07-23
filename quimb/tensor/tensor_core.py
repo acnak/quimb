@@ -1,16 +1,16 @@
 """Core tensor network tools.
 """
-import os
+import collections
+import contextlib
 import copy
-import uuid
-import math
-import string
-import weakref
-import operator
 import functools
 import itertools
-import contextlib
-import collections
+import math
+import operator
+import os
+import string
+import uuid
+import weakref
 from numbers import Integral
 
 import numpy as np
@@ -31,7 +31,8 @@ try:
 except ImportError:
     from ..core import common_type as get_common_dtype
 
-from ..core import qarray, prod, realify_scalar, vdot, make_immutable
+from ..core import make_immutable, prod, qarray, realify_scalar, vdot
+from ..gen.rand import rand_matrix, rand_uni, randn, seed_rand
 from ..utils import (
     check_opt,
     concat,
@@ -44,9 +45,9 @@ from ..utils import (
     unique,
     valmap,
 )
-from ..gen.rand import randn, seed_rand, rand_matrix, rand_uni, rand_iso
 from . import decomp
 from .array_ops import (
+    PArray,
     asarray,
     find_antidiag_axes,
     find_columns,
@@ -54,7 +55,19 @@ from .array_ops import (
     iscomplex,
     ndim,
     norm_fro,
-    PArray,
+)
+from .contraction import (
+    array_contract,
+    array_contract_expression,
+    array_contract_path,
+    array_contract_pathinfo,
+    array_contract_tree,
+    get_contract_backend,
+    get_contract_strategy,
+    get_symbol,
+    get_tensor_linop_backend,
+    inds_to_eq,
+    inds_to_symbols,
 )
 from .drawing import (
     auto_color_html,
@@ -62,20 +75,10 @@ from .drawing import (
     visualize_tensor,
     visualize_tensors,
 )
-
-from .contraction import (
-    array_contract_expression,
-    array_contract_path,
-    array_contract_pathinfo,
-    array_contract_tree,
-    array_contract,
-    contract_strategy,
-    get_contract_backend,
-    get_contract_strategy,
-    get_symbol,
-    get_tensor_linop_backend,
-    inds_to_eq,
-    inds_to_symbols,
+from .fitting import (
+    tensor_network_distance,
+    tensor_network_fit_als,
+    tensor_network_fit_autodiff,
 )
 
 _inds_to_eq = deprecated(inds_to_eq, "_inds_to_eq", "inds_to_eq")
@@ -180,6 +183,7 @@ def maybe_realify_scalar(data):
     return data
 
 
+@functools.singledispatch
 def tensor_contract(
     *tensors,
     output_inds=None,
@@ -389,7 +393,7 @@ def _parse_split_opts(method, cutoff, absorb, max_bond, cutoff_mode, renorm):
     opts["cutoff_mode"] = _CUTOFF_MODES[cutoff_mode]
 
     # renorm doubles up as the power used to renormalize
-    if (method in _FULL_SPLIT_METHODS) and (renorm is None):
+    if (method in _FULL_SPLIT_METHODS) and (renorm is True):
         opts["renorm"] = _RENORM_LOOKUP.get(cutoff_mode, 0)
     else:
         opts["renorm"] = 0 if renorm is None else renorm
@@ -408,6 +412,7 @@ def _check_left_right_isom(method, absorb):
     return left_isom, right_isom
 
 
+@functools.singledispatch
 def tensor_split(
     T,
     left_inds,
@@ -601,6 +606,7 @@ def tensor_split(
     return TensorNetwork(tensors, virtual=True)
 
 
+@functools.singledispatch
 def tensor_canonize_bond(
     T1, T2, absorb="right", gauges=None, gauge_smudge=1e-6, **split_opts
 ):
@@ -666,6 +672,45 @@ def tensor_canonize_bond(
         tn.gauge_simple_remove(outer=outer)
 
 
+def choose_local_compress_gauge_settings(
+    canonize=True,
+    tree_gauge_distance=None,
+    canonize_distance=None,
+    canonize_after_distance=None,
+    mode="auto",
+):
+    """Choose default gauge settings for arbitrary geometry local compression.
+    """
+    if tree_gauge_distance is None:
+        if canonize:
+            # default to r=3 gauge
+            tree_gauge_distance = 3
+        else:
+            tree_gauge_distance = 0
+
+    if mode == "auto":
+        if tree_gauge_distance == 0:
+            # equivalent to basic mode anyway
+            mode = "basic"
+        else:
+            mode = "virtual-tree"
+
+    if canonize_distance is None:
+        # default to the tree gauge distance
+        canonize_distance = tree_gauge_distance
+
+    if canonize_after_distance is None:
+        if mode == "virtual-tree":
+            # can avoid resetting the tree gauge
+            canonize_after_distance = 0
+        elif mode == "basic":
+            # do an eager tree guage and reset
+            canonize_after_distance = tree_gauge_distance
+
+    return canonize_distance, canonize_after_distance, mode
+
+
+@functools.singledispatch
 def tensor_compress_bond(
     T1,
     T2,
@@ -825,6 +870,7 @@ def tensor_compress_bond(
         T2 *= fact_1_2
 
 
+@functools.singledispatch
 def tensor_balance_bond(t1, t2, smudge=1e-6):
     """Gauge the bond between two tensors such that the norm of the 'columns'
     of the tensors on each side is the same for each index of the bond.
@@ -1055,7 +1101,12 @@ def tensor_network_sum(tnA, tnB, inplace=False):
         tb = tnB.tensor_map[tid]
 
         if set(ta.inds) != set(tb.inds):
-            raise ValueError("Can only sum TNs with exactly matching indices.")
+            raise ValueError(
+                "This function can only sum TNs with exactly matching indices."
+                " See `tensor_network_ag_sum` if the two TNs have matching "
+                "`site_tags` structure and outer indices but different bond "
+                "names."
+            )
 
         sum_inds = [ix for ix in ta.inds if ix in oix]
         tab = tensor_direct_product(ta, tb, sum_inds)
@@ -1250,381 +1301,6 @@ def maybe_unwrap(
 
     # else return as a scalar, maybe dropping imaginary part
     return maybe_realify_scalar(t.data)
-
-
-def tensor_network_distance(
-    tnA,
-    tnB,
-    xAA=None,
-    xAB=None,
-    xBB=None,
-    method="auto",
-    normalized=False,
-    **contract_opts,
-):
-    r"""Compute the Frobenius norm distance between two tensor networks:
-
-    .. math::
-
-            D(A, B)
-            = | A - B |_{\mathrm{fro}}
-            = \mathrm{Tr} [(A - B)^{\dagger}(A - B)]^{1/2}
-            = ( \langle A | A \rangle - 2 \mathrm{Re} \langle A | B \rangle|
-            + \langle B | B \rangle ) ^{1/2}
-
-    which should have matching outer indices. Note the default approach to
-    computing the norm is precision limited to about ``eps**0.5`` where ``eps``
-    is the precision of the data type, e.g. ``1e-8`` for float64. This is due
-    to the subtraction in the above expression.
-
-    Parameters
-    ----------
-    tnA : TensorNetwork or Tensor
-        The first tensor network operator.
-    tnB : TensorNetwork or Tensor
-        The second tensor network operator.
-    xAA : None or scalar
-        The value of ``A.H @ A`` if you already know it (or it doesn't matter).
-    xAB : None or scalar
-        The value of ``A.H @ B`` if you already know it (or it doesn't matter).
-    xBB : None or scalar
-        The value of ``B.H @ B`` if you already know it (or it doesn't matter).
-    method : {'auto', 'overlap', 'dense'}, optional
-        How to compute the distance. If ``'overlap'``, the default, the
-        distance will be computed as the sum of overlaps, without explicitly
-        forming the dense operators. If ``'dense'``, the operators will be
-        directly formed and the norm computed, which can be quicker when the
-        exterior dimensions are small. If ``'auto'``, the dense method will
-        be used if the total operator (outer) size is ``<= 2**16``.
-    normalized : bool, optional
-        If ``True``, then normalize the distance by the norm of the two
-        operators, i.e. ``2 * D(A, B) / (|A| + |B|)``. The resulting distance
-        lies between 0 and 2 and is more useful for assessing convergence.
-    contract_opts
-        Supplied to :meth:`~quimb.tensor.tensor_core.TensorNetwork.contract`.
-
-    Returns
-    -------
-    D : float
-    """
-    check_opt("method", method, ("auto", "dense", "overlap"))
-
-    tnA = tnA.as_network()
-    tnB = tnB.as_network()
-
-    oix = tnA.outer_inds()
-    if set(oix) != set(tnB.outer_inds()):
-        raise ValueError(
-            "Can only compute distance between tensor "
-            "networks with matching outer indices."
-        )
-
-    if method == "auto":
-        d = tnA.inds_size(oix)
-        if d <= 1 << 16:
-            method = "dense"
-        else:
-            method = "overlap"
-
-    # directly from vectorizations of both
-    if method == "dense":
-        tnA = tnA.contract(..., output_inds=oix, preserve_tensor=True)
-        tnB = tnB.contract(..., output_inds=oix, preserve_tensor=True)
-
-    # overlap method
-    if xAA is None:
-        xAA = (tnA | tnA.H).contract(..., **contract_opts)
-    if xAB is None:
-        xAB = (tnA | tnB.H).contract(..., **contract_opts)
-    if xBB is None:
-        xBB = (tnB | tnB.H).contract(..., **contract_opts)
-
-    dAB = do("abs", xAA - 2 * do("real", xAB) + xBB) ** 0.5
-
-    if normalized:
-        dAB *= 2 / (do("abs", xAA)**0.5 + do("abs", xBB)**0.5)
-
-    return dAB
-
-
-def tensor_network_fit_autodiff(
-    tn,
-    tn_target,
-    steps=1000,
-    tol=1e-9,
-    autodiff_backend="autograd",
-    contract_optimize="auto-hq",
-    distance_method="auto",
-    inplace=False,
-    progbar=False,
-    **kwargs,
-):
-    """Optimize the fit of ``tn`` with respect to ``tn_target`` using
-    automatic differentation. This minimizes the norm of the difference
-    between the two tensor networks, which must have matching outer indices,
-    using overlaps.
-
-    Parameters
-    ----------
-    tn : TensorNetwork
-        The tensor network to fit.
-    tn_target : TensorNetwork
-        The target tensor network to fit ``tn`` to.
-    steps : int, optional
-        The maximum number of autodiff steps.
-    tol : float, optional
-        The target norm distance.
-    autodiff_backend : str, optional
-        Which backend library to use to perform the gradient computation.
-    contract_optimize : str, optional
-        The contraction path optimized used to contract the overlaps.
-    distance_method : {'auto', 'dense', 'overlap'}, optional
-        Supplied to :func:`~quimb.tensor.tensor_core.tensor_network_distance`,
-        controls how the distance is computed.
-    inplace : bool, optional
-        Update ``tn`` in place.
-    progbar : bool, optional
-        Show a live progress bar of the fitting process.
-    kwargs
-        Passed to :class:`~quimb.tensor.tensor_core.optimize.TNOptimizer`.
-
-    See Also
-    --------
-    tensor_network_distance, tensor_network_fit_als
-    """
-    from .optimize import TNOptimizer
-
-    xBB = (tn_target | tn_target.H).contract(
-        ...,
-        output_inds=(),
-        optimize=contract_optimize,
-    )
-
-    tnopt = TNOptimizer(
-        tn=tn,
-        loss_fn=tensor_network_distance,
-        loss_constants={"tnB": tn_target, "xBB": xBB},
-        loss_kwargs={"method": distance_method, "optimize": contract_optimize},
-        autodiff_backend=autodiff_backend,
-        progbar=progbar,
-        **kwargs,
-    )
-
-    tn_fit = tnopt.optimize(steps, tol=tol)
-
-    if not inplace:
-        return tn_fit
-
-    for t1, t2 in zip(tn, tn_fit):
-        t1.modify(data=t2.data)
-
-    return tn
-
-
-def _tn_fit_als_core(
-    var_tags,
-    tnAA,
-    tnAB,
-    xBB,
-    tol,
-    contract_optimize,
-    steps,
-    enforce_pos,
-    pos_smudge,
-    solver="solve",
-    progbar=False,
-):
-    # shared intermediates + greedy = good reuse of contractions
-    with contract_strategy(contract_optimize):
-        # prepare each of the contractions we are going to repeat
-        env_contractions = []
-        for tg in var_tags:
-            # varying tensor and conjugate in norm <A|A>
-            tk = tnAA["__KET__", tg]
-            tb = tnAA["__BRA__", tg]
-
-            # get inds, and ensure any bonds come last, for linalg.solve
-            lix, bix, rix = group_inds(tb, tk)
-            tk.transpose_(*rix, *bix)
-            tb.transpose_(*lix, *bix)
-
-            # form TNs with 'holes', i.e. environment tensors networks
-            A_tn = tnAA.select((tg,), "!all")
-            y_tn = tnAB.select((tg,), "!all")
-
-            env_contractions.append((tk, tb, lix, bix, rix, A_tn, y_tn))
-
-        if tol != 0.0:
-            old_d = float("inf")
-
-        if progbar:
-            import tqdm
-
-            pbar = tqdm.trange(steps)
-        else:
-            pbar = range(steps)
-
-        # the main iterative sweep on each tensor, locally optimizing
-        for _ in pbar:
-            for tk, tb, lix, bix, rix, A_tn, y_tn in env_contractions:
-                Ni = A_tn.to_dense(lix, rix)
-                Wi = y_tn.to_dense(rix, bix)
-
-                if enforce_pos:
-                    el, ev = do("linalg.eigh", Ni)
-                    el = do("clip", el, el[-1] * pos_smudge, None)
-                    Ni_p = ev * do("reshape", el, (1, -1)) @ dag(ev)
-                else:
-                    Ni_p = Ni
-
-                if solver == "solve":
-                    x = do("linalg.solve", Ni_p, Wi)
-                elif solver == "lstsq":
-                    x = do("linalg.lstsq", Ni_p, Wi, rcond=pos_smudge)[0]
-
-                x_r = do("reshape", x, tk.shape)
-                # n.b. because we are using virtual TNs -> updates propagate
-                tk.modify(data=x_r)
-                tb.modify(data=do("conj", x_r))
-
-            # assess | A - B | for convergence or printing
-            if (tol != 0.0) or progbar:
-                xAA = do("trace", dag(x) @ (Ni @ x))  # <A|A>
-                xAB = do("trace", do("real", dag(x) @ Wi))  # <A|B>
-                d = do("abs", (xAA - 2 * xAB + xBB)) ** 0.5
-                if abs(d - old_d) < tol:
-                    break
-                old_d = d
-
-            if progbar:
-                pbar.set_description(str(d))
-
-
-def tensor_network_fit_als(
-    tn,
-    tn_target,
-    tags=None,
-    steps=100,
-    tol=1e-9,
-    solver="solve",
-    enforce_pos=False,
-    pos_smudge=None,
-    tnAA=None,
-    tnAB=None,
-    xBB=None,
-    contract_optimize="greedy",
-    inplace=False,
-    progbar=False,
-):
-    """Optimize the fit of ``tn`` with respect to ``tn_target`` using
-    alternating least squares (ALS). This minimizes the norm of the difference
-    between the two tensor networks, which must have matching outer indices,
-    using overlaps.
-
-    Parameters
-    ----------
-    tn : TensorNetwork
-        The tensor network to fit.
-    tn_target : TensorNetwork
-        The target tensor network to fit ``tn`` to.
-    tags : sequence of str, optional
-        If supplied, only optimize tensors matching any of given tags.
-    steps : int, optional
-        The maximum number of ALS steps.
-    tol : float, optional
-        The target norm distance.
-    solver : {'solve', 'lstsq', ...}, optional
-        The underlying driver function used to solve the local minimization,
-        e.g. ``numpy.linalg.solve`` for ``'solve'`` with ``numpy`` backend.
-    enforce_pos : bool, optional
-        Whether to enforce positivity of the locally formed environments,
-        which can be more stable.
-    pos_smudge : float, optional
-        If enforcing positivity, the level below which to clip eigenvalues
-        for make the local environment positive definite.
-    tnAA : TensorNetwork, optional
-        If you have already formed the overlap ``tn.H & tn``, maybe
-        approximately, you can supply it here. The unconjugated layer should
-        have tag ``'__KET__'`` and the conjugated layer ``'__BRA__'``. Each
-        tensor being optimized should have tag ``'__VAR{i}__'``.
-    tnAB : TensorNetwork, optional
-        If you have already formed the overlap ``tn_target.H & tn``, maybe
-        approximately, you can supply it here. Each tensor being optimized
-        should have tag ``'__VAR{i}__'``.
-    xBB : float, optional
-        If you have already know, have computed ``tn_target.H @ tn_target``,
-        or it doesn't matter, you can supply the value here.
-    contract_optimize : str, optional
-        The contraction path optimized used to contract the local environments.
-        Note ``'greedy'`` is the default in order to maximize shared work.
-    inplace : bool, optional
-        Update ``tn`` in place.
-    progbar : bool, optional
-        Show a live progress bar of the fitting process.
-
-    Returns
-    -------
-    TensorNetwork
-
-    See Also
-    --------
-    tensor_network_fit_autodiff, tensor_network_distance
-    """
-    # mark the tensors we are going to optimize
-    tna = tn.copy()
-    tna.add_tag("__KET__")
-
-    if tags is None:
-        to_tag = tna
-    else:
-        to_tag = tna.select_tensors(tags, "any")
-
-    var_tags = []
-    for i, t in enumerate(to_tag):
-        var_tag = f"__VAR{i}__"
-        t.add_tag(var_tag)
-        var_tags.append(var_tag)
-
-    # form the norm of the varying TN (A) and its overlap with the target (B)
-    if tnAA is None:
-        tnAA = tna | tna.H.retag_({"__KET__": "__BRA__"})
-    if tnAB is None:
-        tnAB = tna | tn_target.H
-
-    if (tol != 0.0) and (xBB is None):
-        # <B|B>
-        xBB = (tn_target | tn_target.H).contract(
-            ...,
-            optimize=contract_optimize,
-            output_inds=(),
-        )
-
-    if pos_smudge is None:
-        pos_smudge = max(tol, 1e-15)
-
-    _tn_fit_als_core(
-        var_tags=var_tags,
-        tnAA=tnAA,
-        tnAB=tnAB,
-        xBB=xBB,
-        tol=tol,
-        contract_optimize=contract_optimize,
-        steps=steps,
-        enforce_pos=enforce_pos,
-        pos_smudge=pos_smudge,
-        solver=solver,
-        progbar=progbar,
-    )
-
-    if not inplace:
-        tn = tn.copy()
-
-    for t1, t2 in zip(tn, tna):
-        # transpose so only thing changed in original TN is data
-        t2.transpose_like_(t1)
-        t1.modify(data=t2.data)
-
-    return tn
 
 
 # --------------------------------------------------------------------------- #
@@ -2137,6 +1813,47 @@ class Tensor:
         new_inds = list(self.inds)
         new_inds.insert(axis, name)
         self.modify(data=new_data, inds=new_inds)
+
+    def new_ind_pair_with_identity(
+        self, new_left_ind, new_right_ind, d, inplace=False,
+    ):
+        """Expand this tensor with two new indices of size ``d``, by taking an
+        (outer) tensor product with the identity operator. The two new indices
+        are added as axes at the start of the tensor.
+
+        Parameters
+        ----------
+        new_left_ind : str
+            Name of the new left index.
+        new_right_ind : str
+            Name of the new right index.
+        d : int
+            Size of the new indices.
+        inplace : bool, optional
+            Whether to perform the expansion inplace.
+
+        Returns
+        -------
+        Tensor
+        """
+        t = self if inplace else self.copy()
+
+        # tensor product identity in
+        x_id = do("eye", d, dtype=t.dtype, like=t.data)
+        output = tuple(range(t.ndim + 2))
+        new_data = array_contract(
+            arrays=(x_id, t.data),
+            inputs=(output[:2], output[2:]),
+            output=output
+        )
+        # update indices
+        new_inds = (new_left_ind, new_right_ind, *t.inds)
+        t.modify(data=new_data, inds=new_inds)
+        return t
+
+    new_ind_pair_with_identity_ = functools.partialmethod(
+        new_ind_pair_with_identity, inplace=True
+    )
 
     def conj(self, inplace=False):
         """Conjugate this tensors data (does nothing to indices)."""
@@ -3178,6 +2895,18 @@ class Tensor:
         new_tags = self.tags | other.tags
         return self.__class__(data_out, inds=new_inds, tags=new_tags)
 
+    def negate(self, inplace=False):
+        """Negate this tensor."""
+        t = self if inplace else self.copy()
+        t.modify(apply=lambda x: -x)
+        return t
+
+    negate_ = functools.partialmethod(negate, inplace=True)
+
+    def __neg__(self):
+        """Negate this tensor."""
+        return self.negate()
+
     def as_network(self, virtual=True):
         """Return a ``TensorNetwork`` with only this tensor."""
         return TensorNetwork((self,), virtual=virtual)
@@ -3940,7 +3669,8 @@ class TensorNetwork(object):
 
     def combine(self, other, *, virtual=False, check_collisions=True):
         """Combine this tensor network with another, returning a new tensor
-        network.
+        network. This can be overriden by subclasses to check for a compatible
+        structured type.
 
         Parameters
         ----------
@@ -4589,6 +4319,15 @@ class TensorNetwork(object):
 
     multiply_each_ = functools.partialmethod(multiply_each, inplace=True)
 
+    def negate(self, inplace=False):
+        """Negate this tensor network."""
+        negated = self if inplace else self.copy()
+        t = next(iter(negated))
+        t.negate_()
+        return negated
+
+    negate_ = functools.partialmethod(negate, inplace=True)
+
     def __mul__(self, other):
         """Scalar multiplication."""
         return self.multiply(other)
@@ -4608,6 +4347,10 @@ class TensorNetwork(object):
     def __itruediv__(self, other):
         """Inplace scalar division."""
         return self.multiply_(other**-1)
+
+    def __neg__(self):
+        """Negate this tensor network."""
+        return self.negate()
 
     def __iter__(self):
         return iter(self.tensor_map.values())
@@ -4736,8 +4479,8 @@ class TensorNetwork(object):
 
 
         """
-        import pickle
         import hashlib
+        import pickle
 
         inputs, output, size_dict = self.get_inputs_output_size_dict(
             output_inds=output_inds,
@@ -6041,22 +5784,16 @@ class TensorNetwork(object):
                 **canonize_opts,
             )
 
-        if mode == 'basic':
-            tensor_compress_bond(
-                ta, tb, **compress_opts
-            )
-        elif mode == 'virtual-tree':
+        if mode == "basic":
+            tensor_compress_bond(ta, tb, **compress_opts)
+        elif mode == "virtual-tree":
             self._compress_between_virtual_tree_tids(
                 tid1, tid2, **compress_opts
             )
-        elif mode == 'full-bond':
-            self._compress_between_full_bond_tids(
-                tid1, tid2, **compress_opts
-            )
-        elif mode == 'local-fit':
-            self._compress_between_local_fit(
-                tid1, tid2, **compress_opts
-            )
+        elif mode == "full-bond":
+            self._compress_between_full_bond_tids(tid1, tid2, **compress_opts)
+        elif mode == "local-fit":
+            self._compress_between_local_fit(tid1, tid2, **compress_opts)
         else:
             # assume callable
             mode(self, tid1, tid2, **compress_opts)
@@ -6149,18 +5886,83 @@ class TensorNetwork(object):
             **compress_opts,
         )
 
-    def compress_all(self, inplace=False, **compress_opts):
-        """Inplace compress all bonds in this network."""
-        tn = self if inplace else self.copy()
-        tn.fuse_multibonds_()
+    def compress_all(
+        self,
+        max_bond=None,
+        cutoff=1e-10,
+        canonize=True,
+        tree_gauge_distance=None,
+        canonize_distance=None,
+        canonize_after_distance=None,
+        mode="auto",
+        inplace=False,
+        **compress_opts
+    ):
+        """Compress all bonds one by one in this network.
 
+        Parameters
+        ----------
+        max_bond : int or None, optional
+            The maxmimum bond dimension to compress to.
+        cutoff : float, optional
+            The singular value cutoff to use.
+        tree_gauge_distance : int, optional
+            How far to include local tree gauge information when compressing.
+            If the local geometry is a tree, then each compression will be
+            locally optimal up to this distance.
+        canonize_distance : int, optional
+            How far to locally canonize around the target tensors first, this
+            is set automatically by ``tree_gauge_distance`` if not specified.
+        canonize_after_distance : int, optional
+            How far to locally canonize around the target tensors after, this
+            is set automatically by ``tree_gauge_distance``, depending on
+            ``mode`` if not specified.
+        mode : {'auto', 'basic', 'virtual-tree'}, optional
+            The mode to use for compressing the bonds. If 'auto', will use
+            'basic' if ``tree_gauge_distance == 0`` else 'virtual-tree'.
+        inplace : bool, optional
+            Whether to perform the compression inplace.
+        compress_opts
+            Supplied to
+            :func:`~quimb.tensor.tensor_core.TensorNetwork.compress_between`.
+
+        Returns
+        -------
+        TensorNetwork
+
+        See Also
+        --------
+        compress_between, canonize_all
+        """
+        tn = self if inplace else self.copy()
+
+        canonize_distance, canonize_after_distance, mode = (
+            choose_local_compress_gauge_settings(
+                canonize,
+                tree_gauge_distance,
+                canonize_distance,
+                canonize_after_distance,
+                mode,
+            )
+        )
+
+        tn.fuse_multibonds_()
         for ix in tuple(tn.ind_map):
             try:
                 tid1, tid2 = tn.ind_map[ix]
             except (ValueError, KeyError):
                 # not a bond, or index already compressed away
                 continue
-            tn._compress_between_tids(tid1, tid2, **compress_opts)
+            tn._compress_between_tids(
+                tid1,
+                tid2,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                mode=mode,
+                canonize_distance=canonize_distance,
+                canonize_after_distance=canonize_after_distance,
+                **compress_opts
+            )
 
         return tn
 
@@ -6459,6 +6261,27 @@ class TensorNetwork(object):
         neighbors -= tids
 
         return neighbors
+
+    def _get_neighbor_inds(self, inds):
+        """Get the indices connected to the index(es) at ``inds``.
+
+        Parameters
+        ----------
+        inds : str or sequence of str
+            The index(es) to get the neighbors of.
+
+        Returns
+        -------
+        oset[str]
+        """
+        inds = tags_to_oset(inds)
+        neighbor_inds = oset_union(
+            self.tensor_map[tid].inds
+            for ind in inds
+            for tid in self.ind_map[ind]
+        )
+        neighbor_inds -= inds
+        return neighbor_inds
 
     def _get_subgraph_tids(self, tids):
         """Get the tids of tensors connected, by any distance, to the tensor or
@@ -8031,6 +7854,80 @@ class TensorNetwork(object):
         tl.reindex_({bond: new_left_ind})
         tr.reindex_({bond: new_right_ind})
         return new_left_ind, new_right_ind
+
+    def drape_bond_between(
+        self,
+        tagsa,
+        tagsb,
+        tags_target,
+        left_ind=None,
+        right_ind=None,
+        inplace=False,
+    ):
+        r"""Take the bond(s) connecting the tensors tagged at ``tagsa`` and
+        ``tagsb``, and 'drape' it through the tensor tagged at ``tags_target``,
+        effectively adding an identity tensor between the two and contracting
+        it with the third::
+
+             ┌─┐    ┌─┐      ┌─┐     ┌─┐
+            ─┤A├─Id─┤B├─    ─┤A├─┐ ┌─┤B├─
+             └─┘    └─┘      └─┘ │ │ └─┘
+                         left_ind│ │right_ind
+                 ┌─┐     -->     ├─┤
+                ─┤C├─           ─┤D├─
+                 └┬┘             └┬┘     where D = C ⊗ Id
+                  │               │
+
+        This increases the size of the target tensor by ``d**2``, and
+        disconnects the tensors at ``tagsa`` and ``tagsb``.
+
+        Parameters
+        ----------
+        tagsa : str or sequence of str
+            The tag(s) identifying the first tensor.
+        tagsb : str or sequence of str
+            The tag(s) identifying the second tensor.
+        tags_target : str or sequence of str
+            The tag(s) identifying the target tensor.
+        left_ind : str, optional
+            The new index to give to the left tensor.
+        right_ind : str, optional
+            The new index to give to the right tensor.
+        inplace : bool, optional
+            Whether to perform the draping inplace.
+
+        Returns
+        -------
+        TensorNetwork
+        """
+        # TODO: tids version?
+        tn = self if inplace else self.copy()
+
+        ta = tn[tagsa]
+        tb = tn[tagsb]
+        _, bix, _ = tensor_make_single_bond(ta, tb)
+        d = ta.ind_size(bix)
+
+        if left_ind is None:
+            left_ind = rand_uuid()
+        if left_ind != bix:
+            ta.reindex_({bix: left_ind})
+
+        if right_ind is None:
+            right_ind = rand_uuid()
+        elif right_ind == left_ind:
+            raise ValueError("right_ind cannot be the same as left_ind")
+        if right_ind != bix:
+            tb.reindex_({bix: right_ind})
+
+        t_target = tn[tags_target]
+        t_target.new_ind_pair_with_identity_(left_ind, right_ind, d)
+
+        return tn
+
+    drape_bond_between_ = functools.partialmethod(
+        drape_bond_between, inplace=True
+    )
 
     def isel(self, selectors, inplace=False):
         """Select specific values for some dimensions/indices of this tensor
@@ -9919,12 +9816,132 @@ class TensorNetwork(object):
         Yields
         ------
         tuple[int]
+
+        See Also
+        --------
+        gen_inds_loops
         """
         from cotengra.core import get_hypergraph
 
         inputs = {tid: t.inds for tid, t in self.tensor_map.items()}
         hg = get_hypergraph(inputs, accel="auto")
         return hg.compute_loops(max_loop_length=max_loop_length)
+
+    def gen_inds_loops(self, max_loop_length=None):
+        """Generate all sequences of indices, up to a specified length, that
+        represent loops in this tensor network. Unlike ``gen_loops`` this
+        function will return the indices of the tensors in the loop rather
+        than the tensor ids, allowing one to differentiate between e.g. a
+        double loop and a 'figure of eight' loop.
+
+        Parameters
+        ----------
+        max_loop_length : None or int
+            Set the maximum number of indices that can appear in a loop. If
+            ``None``, wait until any loop is found and set that as the
+            maximum length.
+
+        Yields
+        ------
+        tuple[str]
+
+        See Also
+        --------
+        gen_loops, gen_inds_connected
+        """
+
+        def _normalize_loop(seq):
+            # this returns the lexicographically smallest equivalent
+            # sequence, up to rolling (rotating) and reversing.
+            N = len(seq)
+            i = min(enumerate(seq), key=lambda x: x[1])[0]
+            el_prev = seq[(i - 1) % N]
+            el_next = seq[(i + 1) % N]
+            if el_prev > el_next:
+                return (*seq[i:], *seq[:i])
+            else:
+                return (*seq[i::-1], *seq[-1:i:-1])
+
+        queue = []
+        for ind, tids in self.ind_map.items():
+            # initial starting points - we store both index and tid to keep track
+            # of direction properly, (only need one direction initially)
+            queue.append(((ind, next(iter(tids))),))
+
+        seen = set()
+        while queue:
+            s = queue.pop(0)
+            last_ind, last_tid = s[-1]
+            # get the other connecting tid and tensor
+            # XXX: this will break for dangling and hyper indices
+            (next_tid,) = (
+                tid for tid in self.ind_map[last_ind] if tid != last_tid
+            )
+            next_t = self.tensor_map[next_tid]
+
+            # candidate expansions
+            expansions = [
+                nind for nind in next_t.inds
+                if nind != last_ind
+            ]
+
+            current_inds = {x[0] for x in s}
+            current_tids = {x[1] for x in s}
+
+            for nind in expansions:
+                next_pair = (nind, next_tid)
+
+                if next_pair == s[0]:
+                    # finished a loop! - normalize it to check for duplicates
+                    loop = _normalize_loop([x[0] for x in s])
+                    if loop not in seen:
+                        seen.add(loop)
+                        if max_loop_length is None:
+                            max_loop_length = len(loop)
+                        yield loop
+
+                elif (
+                    # don't double up on indices
+                    (nind not in current_inds) and
+                    # and don't self intersect? XXX: make this a switch?
+                    (next_tid not in current_tids) and
+                    # and don't make the loop too long
+                    (max_loop_length is None) or (len(s) < max_loop_length)
+                ):
+                    # valid candidate extension!
+                    queue.append(s + (next_pair,))
+
+    def gen_inds_connected(self, max_length):
+        """Generate all index 'patches' of size up to ``max_length``.
+
+        Parameters
+        ----------
+        max_length : int
+            The maximum number of indices in the patch.
+
+        Yields
+        ------
+        tuple[str]
+
+        See Also
+        --------
+        gen_inds_loops
+        """
+        queue = [(ix,) for ix in self.ind_map]
+        seen = {frozenset(s) for s in queue}
+        while queue:
+            s = queue.pop()
+            if len(s) == max_length:
+                continue
+            expansions = self._get_neighbor_inds(s)
+            for ix in expansions:
+                next_s = s + (ix,)
+                key = frozenset(next_s)
+                if key not in seen:
+                    # new string
+                    yield next_s
+                    seen.add(key)
+                    queue.append(next_s)
 
     def _get_string_between_tids(self, tida, tidb):
         strings = [(tida,)]

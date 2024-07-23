@@ -23,9 +23,7 @@ from autoray import (
 )
 
 from ..core import njit
-from ..linalg import base_linalg
-from ..linalg import rand_linalg
-
+from ..linalg import base_linalg, rand_linalg
 
 _CUTOFF_MODE_MAP = {
     "abs": 1,
@@ -108,6 +106,14 @@ def sgn(x):
 def sgn_numba(x):
     x0 = x == 0.0
     return (x + x0) / (np.abs(x) + x0)
+
+
+@sgn.register("tensorflow")
+def sgn_tf(x):
+    with backend_like(x):
+        x0 = do("cast", do("equal", x, 0.0), x.dtype)
+        xa = do("cast", do("abs", x), x.dtype)
+        return (x + x0) / (xa + x0)
 
 
 def _trim_and_renorm_svd_result(
@@ -378,7 +384,7 @@ def svd_truncated_numpy(
         return svd_truncated_numba(
             x, cutoff, cutoff_mode, max_bond, absorb, renorm
         )
-    except np.linalg.LinAlgError as e:  # pragma: no cover
+    except ValueError as e:  # pragma: no cover
         warnings.warn(f"Got: {e}, falling back to scipy gesvd driver.")
         U, s, VH = scla.svd(x, full_matrices=False, lapack_driver="gesvd")
         return _trim_and_renorm_svd_result_numba(
@@ -983,7 +989,7 @@ _similarity_compress_fns = {
 }
 
 
-def similarity_compress(X, max_bond, renorm=True, method="eigh"):
+def similarity_compress(X, max_bond, renorm=False, method="eigh"):
     if method == "eig":
         if get_dtype_name(X) == "float64":
             X = astype(X, "complex128")
@@ -1057,11 +1063,7 @@ def isometrize_cayley(x, backend):
         )
         x = x - dag(x)
         x = x / 2.0
-        if backend == "torch":
-            # XXX: move device handling upstream in to autoray?
-            Id = do("eye", d, like=x, device=x.device)
-        else:
-            Id = do("eye", d, like=x)
+        Id = do("eye", d, like=x)
         Q = do("linalg.solve", Id - x, Id + x)
         return Q[:m, :n]
 

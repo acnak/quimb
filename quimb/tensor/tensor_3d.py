@@ -985,6 +985,75 @@ class TensorNetwork3D(TensorNetworkGen):
                 tag_a, tag_b, max_bond=max_bond, cutoff=cutoff, **compress_opts
             )
 
+    def _contract_boundary_core_via_2d(
+        self,
+        xrange,
+        yrange,
+        zrange,
+        from_which,
+        max_bond,
+        cutoff=1e-10,
+        method="local-early",
+        layer_tags=None,
+        **compress_opts,
+    ):
+        from quimb.tensor.tensor_2d_compress import tensor_network_2d_compress
+
+        r2d = Rotator3D(self, xrange, yrange, zrange, from_which)
+        site_tag = r2d.site_tag
+        istep = r2d.istep
+
+        def _do_compress(site_tag_tmps):
+            nonlocal self
+
+            # split off the boundary network
+            self, tn_boundary = self.partition(site_tag_tmps, inplace=True)
+
+            # compress it inplace
+            tensor_network_2d_compress(
+                tn_boundary,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                method=method,
+                site_tags=site_tag_tmps,
+                inplace=True,
+                **compress_opts,
+            )
+
+            # recombine with the main network
+            self |= tn_boundary
+
+        # maybe compress the initial row, which may be multiple layers
+        # and have effective bond dimension > max_bond already
+        site_tag_tmps = [
+            site_tag(r2d.sweep[0], j, k) for j, k in r2d.sweep_other
+        ]
+        if any(len(self.tag_map[st]) > 1 for st in site_tag_tmps):
+            _do_compress(site_tag_tmps)
+
+        site_tag_tmps = [f"__ST{j},{k}__" for j, k in r2d.sweep_other]
+
+        if layer_tags is None:
+            layer_tags = [None]
+
+        for i in r2d.sweep[:-1]:
+            for layer_tag in layer_tags:
+                for (j, k), st in zip(r2d.sweep_other, site_tag_tmps):
+                    # group outer single tensor with inner tensor(s)
+                    tag1 = site_tag(i, j, k)  # outer
+                    tag2 = site_tag(i + istep, j, k)  # inner
+                    if layer_tag is None:
+                        # tag and compress any inner tensors
+                        self.select_any((tag1, tag2)).add_tag(st)
+                    else:
+                        # only tag and compress one inner layer
+                        self.select_all((tag1,)).add_tag(st)
+                        self.select_all((tag2, layer_tag)).add_tag(st)
+
+                _do_compress(site_tag_tmps)
+
+        self.drop_tags(site_tag_tmps)
+
     def _contract_boundary_core(
         self,
         xrange,
@@ -1187,8 +1256,6 @@ class TensorNetwork3D(TensorNetworkGen):
         """Unified entrypoint for contracting any rectangular patch of tensors
         from any direction, with any boundary method.
         """
-        check_opt("mode", mode, ("peps", "projector"))
-
         tn = self if inplace else self.copy()
 
         # universal options
@@ -1201,15 +1268,22 @@ class TensorNetwork3D(TensorNetworkGen):
         contract_boundary_opts["equalize_norms"] = equalize_norms
         contract_boundary_opts["compress_opts"] = compress_opts
 
-        if mode == "projector":
+        if mode == "peps":
+            return tn._contract_boundary_core(
+                canonize_opts=canonize_opts,
+                **contract_boundary_opts,
+            )
+
+        if mode == "l2bp3d":
+            return tn._contract_boundary_l2bp(**contract_boundary_opts)
+
+        if mode == "projector3d":
             return tn._contract_boundary_projector(
                 canonize_opts=canonize_opts, **contract_boundary_opts
             )
 
-        # mode == 'peps' options
-        return tn._contract_boundary_core(
-            canonize_opts=canonize_opts,
-            **contract_boundary_opts,
+        return tn._contract_boundary_core_via_2d(
+            method=mode, **contract_boundary_opts
         )
 
     contract_boundary_from_ = functools.partialmethod(
@@ -1491,7 +1565,7 @@ class TensorNetwork3D(TensorNetworkGen):
         lazy=False,
         mode="projector",
         compress_opts=None,
-        sequence=("xmin", "xmax", "ymin", "ymax", "zmin", "zmax"),
+        sequence=None,
         xmin=None,
         xmax=None,
         ymin=None,
@@ -1517,6 +1591,23 @@ class TensorNetwork3D(TensorNetworkGen):
         if lazy:
             # we are implicitly asking for the tensor network
             final_contract = False
+
+        if sequence is None:
+            sequence = []
+            if self.is_cyclic_x():
+                sequence.append("xmin")
+            else:
+                sequence.extend(["xmin", "xmax"])
+
+            if self.is_cyclic_y():
+                sequence.append("ymin")
+            else:
+                sequence.extend(["ymin", "ymax"])
+
+            if self.is_cyclic_z():
+                sequence.append("zmin")
+            else:
+                sequence.extend(["zmin", "zmax"])
 
         return self._contract_interleaved_boundary_sequence(
             contract_boundary_opts=contract_boundary_opts,
@@ -2216,10 +2307,14 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
         self._Lx = len(arrays)
         self._Ly = len(arrays[0])
         self._Lz = len(arrays[0][0])
-        tensors = []
+
+        cyclicx = sum(d > 1 for d in arrays[0][1][1].shape) == 7
+        cyclicy = sum(d > 1 for d in arrays[1][0][1].shape) == 7
+        cyclicz = sum(d > 1 for d in arrays[0][1][0].shape) == 7
 
         # cache for both creating and retrieving indices
         ix = defaultdict(rand_uuid)
+        tensors = []
 
         for i, j, k in self.gen_site_coos():
             array = arrays[i][j][k]
@@ -2227,17 +2322,17 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
             # figure out if we need to transpose the arrays from some order
             #     other than up right front down left behind physical
             array_order = shape
-            if i == self.Lx - 1:
+            if (not cyclicx) and (i == self.Lx - 1):
                 array_order = array_order.replace("u", "")
-            if j == self.Ly - 1:
+            if (not cyclicy) and (j == self.Ly - 1):
                 array_order = array_order.replace("r", "")
-            if k == self.Lz - 1:
+            if (not cyclicz) and (k == self.Lz - 1):
                 array_order = array_order.replace("f", "")
-            if i == 0:
+            if (not cyclicx) and (i == 0):
                 array_order = array_order.replace("d", "")
-            if j == 0:
+            if (not cyclicy) and (j == 0):
                 array_order = array_order.replace("l", "")
-            if k == 0:
+            if (not cyclicz) and (k == 0):
                 array_order = array_order.replace("b", "")
 
             # allow convention of missing bonds to be singlet dimensions
@@ -2253,17 +2348,23 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
             # get the relevant indices corresponding to neighbours
             inds = []
             if "u" in array_order:
-                inds.append(ix[(i, j, k), (i + 1, j, k)])
+                i_u = (i + 1) % self.Lx
+                inds.append(ix[frozenset(((i, j, k), (i_u, j, k)))])
             if "r" in array_order:
-                inds.append(ix[(i, j, k), (i, j + 1, k)])
+                j_r = (j + 1) % self.Ly
+                inds.append(ix[frozenset(((i, j, k), (i, j_r, k)))])
             if "f" in array_order:
-                inds.append(ix[(i, j, k), (i, j, k + 1)])
+                k_f = (k + 1) % self.Lz
+                inds.append(ix[frozenset(((i, j, k), (i, j, k_f)))])
             if "d" in array_order:
-                inds.append(ix[(i - 1, j, k), (i, j, k)])
+                i_d = (i - 1) % self.Lx
+                inds.append(ix[frozenset(((i_d, j, k), (i, j, k)))])
             if "l" in array_order:
-                inds.append(ix[(i, j - 1, k), (i, j, k)])
+                j_l = (j - 1) % self.Ly
+                inds.append(ix[frozenset(((i, j_l, k), (i, j, k)))])
             if "b" in array_order:
-                inds.append(ix[(i, j, k - 1), (i, j, k)])
+                k_b = (k - 1) % self.Lz
+                inds.append(ix[frozenset(((i, j, k_b), (i, j, k)))])
             inds.append(self.site_ind(i, j, k))
 
             # mix site, slice and global tags
@@ -2317,7 +2418,10 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
 
     @classmethod
     def from_fill_fn(
-        cls, fill_fn, Lx, Ly, Lz, bond_dim, phys_dim=2, **peps3d_opts
+        cls, fill_fn, Lx, Ly, Lz, bond_dim, phys_dim=2,
+        cyclic=False,
+        shape="urfdlbp",
+        **peps3d_opts
     ):
         """Create a 3D PEPS from a filling function with signature
         ``fill_fn(shape)``.
@@ -2332,8 +2436,12 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
             The number of z-slices.
         bond_dim : int
             The bond dimension.
-        physical : int, optional
+        phys_dim : int, optional
             The physical index dimension.
+        shape : str, optional
+            How to layout the indices of the tensors, the default is
+            ``(up, right, front, down, left, back, phys) == 'urfdlbp'``. This
+            is the order of the shape supplied to the filling function.
         peps_opts
             Supplied to :class:`~quimb.tensor.tensor_3d.PEPS3D`.
 
@@ -2345,23 +2453,31 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
             [[None for _ in range(Lz)] for _ in range(Ly)] for _ in range(Lx)
         ]
 
-        for i, j, k in product(range(Lx), range(Ly), range(Lz)):
-            shape = []
-            if i != Lx - 1:  # bond up
-                shape.append(bond_dim)
-            if j != Ly - 1:  # bond right
-                shape.append(bond_dim)
-            if k != Lz - 1:  # bond front
-                shape.append(bond_dim)
-            if i != 0:  # bond down
-                shape.append(bond_dim)
-            if j != 0:  # bond left
-                shape.append(bond_dim)
-            if k != 0:  # bond behind
-                shape.append(bond_dim)
-            shape.append(phys_dim)
+        try:
+            cyclicx, cyclicy, cyclicz = cyclic
+        except (TypeError, ValueError):
+            cyclicx = cyclicy = cyclicz = cyclic
 
-            arrays[i][j][k] = fill_fn(shape)
+        for i, j, k in product(range(Lx), range(Ly), range(Lz)):
+            shp = []
+
+            for which in shape:
+                if (which == "u") and (cyclicx or (i != Lx - 1)):  # up
+                    shp.append(bond_dim)
+                elif (which == "r") and (cyclicy or (j != Ly - 1)):  # right
+                    shp.append(bond_dim)
+                elif (which == "f") and (cyclicz or (k != Lz - 1)):  # front
+                    shp.append(bond_dim)
+                elif (which == "d") and (cyclicx or (i != 0)):  # down
+                    shp.append(bond_dim)
+                elif (which == "l") and (cyclicy or (j != 0)):  # left
+                    shp.append(bond_dim)
+                elif (which == "b") and (cyclicz or (k != 0)):  # back
+                    shp.append(bond_dim)
+
+            shp.append(phys_dim)
+
+            arrays[i][j][k] = fill_fn(shp)
 
         return cls(arrays, **peps3d_opts)
 
@@ -2465,6 +2581,8 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
         Lz,
         bond_dim,
         phys_dim=2,
+        dist="normal",
+        loc=0.0,
         dtype="float64",
         seed=None,
         **peps3d_opts,
@@ -2503,7 +2621,9 @@ class PEPS3D(TensorNetwork3DVector, TensorNetwork3DFlat):
 
         def fill_fn(shape):
             return ops.sensibly_scale(
-                ops.sensibly_scale(randn(shape, dtype=dtype))
+                ops.sensibly_scale(
+                    randn(shape, dist=dist, loc=loc, dtype=dtype)
+                )
             )
 
         return cls.from_fill_fn(

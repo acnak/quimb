@@ -1260,6 +1260,7 @@ class TensorNetwork2D(TensorNetworkGen):
         layer_tags=None,
         **compress_opts,
     ):
+        method='zipup'
         from quimb.tensor.tensor_1d_compress import tensor_network_1d_compress
 
         r2d = Rotator2D(self, xrange, yrange, from_which)
@@ -1756,12 +1757,11 @@ class TensorNetwork2D(TensorNetworkGen):
         contract_boundary_opts["sweep_reverse"] = sweep_reverse
 
         if mode == "mps":
-            tn._contract_boundary_core(**contract_boundary_opts)
+            tn._contract_boundary_core_via_1d(
+                method=mode, **contract_boundary_opts
+            )
             return tn
 
-        tn._contract_boundary_core_via_1d(
-            method=mode, **contract_boundary_opts
-        )
         return tn
 
     contract_boundary_from_ = functools.partialmethod(

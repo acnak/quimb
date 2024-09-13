@@ -1318,8 +1318,8 @@ class TensorNetwork1DFlat(TensorNetwork1D):
 
         self.canonicalize_(i, info=info)
 
-        Tm1 = psi[i]
-        left_inds = Tm1.bonds(psi[i - 1])
+        Tm1 = self[i]
+        left_inds = Tm1.bonds(self[i - 1])
         return Tm1.singular_values(left_inds, method=method)
 
     def expand_bond_dimension(

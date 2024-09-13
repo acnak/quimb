@@ -2373,6 +2373,31 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
 
         return self.singular_values(i, info=info, method=method) ** 2
 
+    def concentratable_entropy(self, s):
+        """Determine the concentratable entropy of some set s as per
+        https://arxiv.org/pdf/2104.06923.pdf
+
+        Parameters
+        ----------
+        s : tuple or list
+            The set of sites to determine the concentratable entropy of
+         
+        Returns
+        -------
+        float
+        """
+
+        power_set = list(chain.from_iterable(combinations(s, r) for r in range(len(s)+1)))[1:]
+
+        e = 1 - 1/(2**len(s))
+        for comb in power_set:
+            rho_red = self.partial_trace(comb).to_dense()
+            e -= 1/(2**len(s))*np.trace(rho_red @ rho_red)
+
+        return e
+
+    def entropy(self, i, cur_orthog=None, method="svd"):
+
     @convert_cur_orthog
     def entropy(self, i, info=None, method="svd"):
         """The entropy of bipartition between the left block of ``i`` sites and
@@ -3349,6 +3374,33 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
 
         super().__init__(tensors, virtual=True, **tn_opts)
 
+    def from_dense(psi, dims, upper_ind_id='k{}', lower_ind_id='b{}', site_tag_id='I{}', **split_opts):
+        L = len(dims)
+        upper_inds = [upper_ind_id.format(i) for i in range(0,int(L/2))]
+        lower_inds = [lower_ind_id.format(i) for i in range(0,int(L/2))]
+        inds = upper_inds + lower_inds
+
+        T = Tensor(reshape(psi.A, dims), inds=inds)
+        def gen_tensors():
+            #           split
+            #       <--  : yield
+            #            : :
+            #     OOOOOOO--O-O-O
+            #     |||||||  | | |
+            #     .......
+            #    left_inds
+            TM = T
+            for i in range(int(L/2) - 1, 0, -1):
+                TM, TR = TM.split(left_inds = upper_inds[:i] + lower_inds[:i], get='tensors',
+                                  rtags=site_tag_id.format(i), **split_opts)
+                yield TR
+
+            TM.add_tag(site_tag_id.format(0))
+            yield TM
+
+        tn = TensorNetwork(gen_tensors())
+        return MatrixProductOperator.from_TN(tn, site_tag_id=site_tag_id, upper_ind_id=upper_ind_id, lower_ind_id=lower_ind_id, cyclic=False, L=int(L/2))
+
     @classmethod
     def from_fill_fn(
         cls,
@@ -3505,6 +3557,7 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         set_default_compress_mode(split_opts)
         # ensure compression is canonical / optimal
         split_opts.setdefault("absorb", "right")
+>>>>>>> c9119d870bcb0b97cb7aa72cd3ee39e0aaa94e01
 
         # make sure array_like
         A = ops.asarray(A)

@@ -422,7 +422,6 @@ register_constant_gate("Z_1_2", qu.Zsqrt(), 1, "Z_1/2")
 register_constant_gate("W_1_2", qu.Wsqrt(), 1, "W_1/2")
 register_constant_gate("HZ_1_2", qu.Wsqrt(), 1, "W_1/2")
 
-
 # constant two qubit gates
 register_constant_gate("CX", qu.cX(), 2)
 register_constant_gate("CNOT", qu.CNOT(), 2, "CX")
@@ -975,7 +974,6 @@ def apply_swap(psi, i, j, **gate_opts):
         # just do swap by lazily reindexing
         iind, jind = map(psi.site_ind, (int(i), int(j)))
         psi.reindex_({iind: jind, jind: iind})
-
     else:
         # tensors are absorbed so propagate_tags is not needed
         gate_opts.pop("propagate_tags", None)

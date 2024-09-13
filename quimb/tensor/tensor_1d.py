@@ -2396,9 +2396,6 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
 
         return e
 
-    def entropy(self, i, cur_orthog=None, method="svd"):
-
-    @convert_cur_orthog
     def entropy(self, i, info=None, method="svd"):
         """The entropy of bipartition between the left block of ``i`` sites and
         the rest.
@@ -3557,7 +3554,6 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         set_default_compress_mode(split_opts)
         # ensure compression is canonical / optimal
         split_opts.setdefault("absorb", "right")
->>>>>>> c9119d870bcb0b97cb7aa72cd3ee39e0aaa94e01
 
         # make sure array_like
         A = ops.asarray(A)
